@@ -1,0 +1,10 @@
+﻿bin/
+obj/
+releases/
+*.user
+*.suo
+.vs/
+*.log
+*.zip
+.DS_Store
+Thumbs.db
