@@ -12,16 +12,17 @@ internal sealed class TrayAppContext : ApplicationContext
     private readonly AppPaths _paths;
     private readonly AlertSoundService _sound;
     private readonly Localizer _text;
+    private readonly BatteryHistoryStore _history;
     private readonly System.Windows.Forms.Timer _pollTimer;
     private readonly DeviceChangeWindow _deviceChangeWindow;
     private readonly Control _uiInvoker;
     private readonly SemaphoreSlim _checkGate = new(1, 1);
-    private readonly object _batteryRefreshLock = new();
 
     private AppSettings _settings;
     private BatteryReading? _lastReading;
-    private CancellationTokenSource? _batteryRefreshCts;
+    private BatteryHistoryWindow? _historyWindow;
     private DateTime _lastAlertUtc = DateTime.MinValue;
+    private int? _lastAlertedBatteryLevel;
     private Icon? _dynamicIcon;
     private ToolStripMenuItem? _statusItem;
     private string? _lastIconKey;
@@ -42,6 +43,7 @@ internal sealed class TrayAppContext : ApplicationContext
         _text = new Localizer(() => _settings);
         _reader = new SoraV2BatteryReader();
         _sound = new AlertSoundService(_paths, () => _settings);
+        _history = new BatteryHistoryStore(_paths);
 
         _contextMenu = new ContextMenuStrip { Font = new Font("Microsoft YaHei UI", 9F) };
         _contextMenu.Closing += KeepSoundMenuOpenWhenPreviewing;
@@ -82,6 +84,7 @@ internal sealed class TrayAppContext : ApplicationContext
         _contextMenu.Items.Add(_statusItem);
         _contextMenu.Items.Add(new ToolStripSeparator());
         _contextMenu.Items.Add(new ToolStripMenuItem(_text["CheckNow"], null, async (_, _) => await CheckNowAsync(clearOnMissing: true, updateUi: true)));
+        _contextMenu.Items.Add(new ToolStripMenuItem(_text["BatteryHistory"], null, (_, _) => ShowBatteryHistoryWindow()));
         _contextMenu.Items.Add(new ToolStripMenuItem(_text["TestSound"], null, (_, _) => _sound.PlayCurrent()));
         _contextMenu.Items.Add(new ToolStripSeparator());
         _contextMenu.Items.Add(BuildNumberMenu(_text["Threshold"], _settings.AlertThreshold, new[] { 5, 10, 15, 20 }, "%", v => UpdateSettings(s => s.AlertThreshold = v)));
@@ -109,6 +112,18 @@ internal sealed class TrayAppContext : ApplicationContext
             menu.DropDownItems.Add(item);
         }
         return menu;
+    }
+
+    private void ShowBatteryHistoryWindow()
+    {
+        if (_historyWindow == null || _historyWindow.IsDisposed)
+            _historyWindow = new BatteryHistoryWindow(_history, _text);
+        else
+            _historyWindow.Reload();
+
+        _historyWindow.Show();
+        _historyWindow.WindowState = FormWindowState.Normal;
+        _historyWindow.Activate();
     }
 
     private ToolStripMenuItem BuildSoundMenu()
@@ -405,6 +420,7 @@ internal sealed class TrayAppContext : ApplicationContext
             if (reading != null)
             {
                 ApplyReading(reading);
+                _history.Append("detected", reading);
                 if (updateUi)
                     RenderTrayState();
                 MaybePlayAlert(reading);
@@ -560,6 +576,7 @@ internal sealed class TrayAppContext : ApplicationContext
             }
             PostRenderTrayState();
             WriteStatusSnapshot(arrived ? "wired_arrived" : "wired_removed", _lastReading);
+            _history.AppendSnapshot(arrived ? "wired_arrived" : "wired_removed", _lastBatteryPercentage, _isCableConnected, _lastReading);
             return;
         }
 
@@ -577,76 +594,42 @@ internal sealed class TrayAppContext : ApplicationContext
             }
             PostRenderTrayState();
             WriteStatusSnapshot(arrived ? "wireless_arrived" : "wireless_removed", _lastReading);
+            _history.AppendSnapshot(arrived ? "wireless_arrived" : "wireless_removed", _lastBatteryPercentage, _isCableConnected, _lastReading);
         }
-    }
-
-    private void LightRefreshConnectionState()
-    {
-        var connection = _reader.DetectConnection();
-        if (connection.WiredPresent)
-        {
-            _isDetected = true;
-            _isCableConnected = true;
-            return;
-        }
-
-        if (connection.WirelessPresent || _lastBatteryBucket.HasValue)
-        {
-            _isDetected = true;
-            _isCableConnected = false;
-            if (_lastReading != null)
-            {
-                _lastReading = new BatteryReading
-                {
-                    BatteryPercentage = _lastBatteryPercentage ?? _lastReading.BatteryPercentage,
-                    HasBatteryPercentage = _lastBatteryPercentage.HasValue || _lastReading.HasBatteryPercentage,
-                    IsCharging = false,
-                    IsFullyCharged = false,
-                    IsOnline = connection.WirelessPresent,
-                    IsCableConnected = false,
-                    Source = _lastReading.Source
-                };
-            }
-            return;
-        }
-
-        _isDetected = false;
-        _isCableConnected = false;
-        _lastReading = null;
-    }
-
-    private void QueueDelayedBatteryRefresh()
-    {
-        CancellationTokenSource cts;
-        lock (_batteryRefreshLock)
-        {
-            _batteryRefreshCts?.Cancel();
-            _batteryRefreshCts?.Dispose();
-            _batteryRefreshCts = new CancellationTokenSource();
-            cts = _batteryRefreshCts;
-        }
-        _ = RunDelayedBatteryRefreshAsync(cts.Token);
-    }
-
-    private async Task RunDelayedBatteryRefreshAsync(CancellationToken token)
-    {
-        try
-        {
-            await Task.Delay(5000, token);
-            await CheckNowAsync(clearOnMissing: false, waitForCurrent: true, updateUi: false);
-            PostRenderTrayState();
-        }
-        catch (OperationCanceledException) { }
     }
 
     private void MaybePlayAlert(BatteryReading reading)
     {
-        if (!reading.HasBatteryPercentage || reading.IsCableConnected || reading.BatteryPercentage <= 0 || reading.BatteryPercentage > _settings.AlertThreshold)
+        if (!reading.HasBatteryPercentage || reading.BatteryPercentage <= 0)
             return;
+
+        if (reading.IsCableConnected || reading.IsCharging || reading.IsFullyCharged || reading.BatteryPercentage > _settings.AlertThreshold)
+        {
+            _lastAlertedBatteryLevel = null;
+            return;
+        }
+
+        var alertLevel = AlertLevelFor(reading.BatteryPercentage);
+        if (_lastAlertedBatteryLevel.HasValue && alertLevel >= _lastAlertedBatteryLevel.Value)
+            return;
+
         if (_lastAlertUtc != DateTime.MinValue && DateTime.UtcNow < _lastAlertUtc.AddMinutes(_settings.AlertCooldownMinutes))
             return;
+
         _lastAlertUtc = DateTime.UtcNow;
+        _lastAlertedBatteryLevel = alertLevel;
         _sound.PlayCurrent();
+    }
+
+    private int AlertLevelFor(int batteryPercentage)
+    {
+        if (batteryPercentage <= 3)
+            return 3;
+        if (batteryPercentage <= 5)
+            return 5;
+        if (batteryPercentage <= 10)
+            return 10;
+        return _settings.AlertThreshold;
     }
 
     private void ApplyTimerInterval()
@@ -684,7 +667,9 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private static int ToBatteryBucket(int percentage)
     {
-        return Math.Clamp((percentage / 5) * 5, 5, 100);
+        if (percentage >= 96)
+            return 100;
+        return Math.Clamp((int)Math.Round(percentage / 5d) * 5, 5, 100);
     }
 
     private void UpdateIcon(bool cableConnected, int batteryBucket)
@@ -780,15 +765,11 @@ internal sealed class TrayAppContext : ApplicationContext
     {
         if (disposing)
         {
-            lock (_batteryRefreshLock)
-            {
-                _batteryRefreshCts?.Cancel();
-                _batteryRefreshCts?.Dispose();
-            }
             _deviceChangeWindow.Dispose();
             _uiInvoker.Dispose();
             _pollTimer.Dispose();
             _contextMenu.Dispose();
+            _historyWindow?.Dispose();
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
             _dynamicIcon?.Dispose();
