@@ -424,14 +424,12 @@ internal sealed class TrayAppContext : ApplicationContext
                 if (updateUi)
                     RenderTrayState();
                 MaybePlayAlert(reading);
-                WriteStatusSnapshot("detected", reading);
                 return true;
             }
 
             ApplyMissingReading(clearOnMissing);
             if (updateUi)
                 RenderTrayState();
-            WriteStatusSnapshot(_isDetected ? "connection_only" : "not_detected", _lastReading);
             return false;
         }
         finally
@@ -575,8 +573,6 @@ internal sealed class TrayAppContext : ApplicationContext
                 };
             }
             PostRenderTrayState();
-            WriteStatusSnapshot(arrived ? "wired_arrived" : "wired_removed", _lastReading);
-            _history.AppendSnapshot(arrived ? "wired_arrived" : "wired_removed", _lastBatteryPercentage, _isCableConnected, _lastReading);
             return;
         }
 
@@ -593,8 +589,6 @@ internal sealed class TrayAppContext : ApplicationContext
                 _isDetected = _lastBatteryBucket.HasValue;
             }
             PostRenderTrayState();
-            WriteStatusSnapshot(arrived ? "wireless_arrived" : "wireless_removed", _lastReading);
-            _history.AppendSnapshot(arrived ? "wireless_arrived" : "wireless_removed", _lastBatteryPercentage, _isCableConnected, _lastReading);
         }
     }
 
@@ -637,32 +631,6 @@ internal sealed class TrayAppContext : ApplicationContext
         _pollTimer.Stop();
         _pollTimer.Interval = Math.Max(1, _settings.PollingIntervalMinutes) * 60 * 1000;
         _pollTimer.Start();
-    }
-
-    private void WriteStatusSnapshot(string state, BatteryReading? reading)
-    {
-        try
-        {
-            _paths.Ensure();
-            var snapshot = new
-            {
-                timestampLocal = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"),
-                timestampUtc = DateTime.UtcNow.ToString("O"),
-                state,
-                detected = _isDetected,
-                batteryPercentage = _lastBatteryPercentage ?? reading?.BatteryPercentage,
-                batteryBucket = _lastBatteryBucket,
-                hasBatteryPercentage = _lastBatteryPercentage.HasValue || reading?.HasBatteryPercentage == true,
-                isCharging = reading?.IsCharging,
-                isFullyCharged = reading?.IsFullyCharged,
-                isCableConnected = _isCableConnected,
-                isOnline = reading?.IsOnline,
-                source = reading?.Source,
-                processId = Environment.ProcessId
-            };
-            File.WriteAllText(_paths.StatusPath, System.Text.Json.JsonSerializer.Serialize(snapshot, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
-        }
-        catch { }
     }
 
     private static int ToBatteryBucket(int percentage)

@@ -37,22 +37,6 @@ internal sealed class BatteryHistoryStore
         });
     }
 
-    public void AppendSnapshot(string state, int? batteryPercentage, bool isCableConnected, BatteryReading? reading)
-    {
-        if (batteryPercentage is null or < 1 or > 100)
-            return;
-
-        AppendRaw(new BatteryHistoryEntry
-        {
-            TimestampUtc = DateTime.UtcNow,
-            BatteryPercentage = batteryPercentage.Value,
-            IsCharging = isCableConnected || reading?.IsCharging == true || reading?.IsFullyCharged == true,
-            IsCableConnected = isCableConnected,
-            State = state,
-            Source = reading?.Source ?? "connection"
-        });
-    }
-
     public IReadOnlyList<BatteryHistoryEntry> ReadLast(TimeSpan range)
     {
         PruneOldEntries();
