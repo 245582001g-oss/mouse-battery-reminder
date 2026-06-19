@@ -5,101 +5,132 @@ namespace SoraV2BatteryTip;
 
 internal sealed class TrayAppContext : ApplicationContext
 {
-    private readonly NotifyIcon _notifyIcon;
-    private readonly ContextMenuStrip _contextMenu;
-    private readonly SoraV2BatteryReader _reader;
-    private readonly SettingsStore _store;
     private readonly AppPaths _paths;
-    private readonly AlertSoundService _sound;
+    private readonly SettingsStore _settingsStore;
     private readonly Localizer _text;
+    private readonly AlertSoundService _sound;
     private readonly BatteryHistoryStore _history;
+    private readonly DiagnosticsExporter _diagnostics;
+    private readonly BatteryCandidateCollector _candidateCollector;
+    private readonly ProfileDraftImporter _draftImporter;
+    private readonly KnownDeviceProfileProvider _profileProvider;
+    private readonly BatteryProviderManager _providerManager;
+    private readonly NotifyIcon _notifyIcon;
+    private readonly ContextMenuStrip _menu;
     private readonly System.Windows.Forms.Timer _pollTimer;
     private readonly DeviceChangeWindow _deviceChangeWindow;
-    private readonly Control _uiInvoker;
+    private readonly Control _ui;
     private readonly SemaphoreSlim _checkGate = new(1, 1);
 
     private AppSettings _settings;
     private BatteryReading? _lastReading;
+    private IReadOnlyList<BatteryReading> _lastReadings = Array.Empty<BatteryReading>();
     private BatteryHistoryWindow? _historyWindow;
-    private DateTime _lastAlertUtc = DateTime.MinValue;
-    private int? _lastAlertedBatteryLevel;
     private Icon? _dynamicIcon;
     private ToolStripMenuItem? _statusItem;
-    private string? _lastIconKey;
-    private string? _lastTrayText;
     private string _statusText = "SORA V2: not detected";
-    private bool _keepSoundMenuOpenAfterClick;
+    private string? _lastTrayText;
+    private string? _lastIconKey;
     private int? _lastBatteryPercentage;
     private int? _lastBatteryBucket;
-    private bool _isCableConnected;
     private bool _isDetected;
+    private bool _isCableConnected;
+    private bool _keepSoundMenuOpen;
+    private DateTime _lastAlertUtc = DateTime.MinValue;
+    private DateTime? _lastCheckLocal;
+    private int? _lastAlertedBatteryLevel;
+    private string _lastSource = "none";
+    private string _lastFailureReason = "not_detected";
 
     public TrayAppContext()
     {
         _paths = new AppPaths();
         _paths.Ensure();
-        _store = new SettingsStore(_paths);
-        _settings = _store.Load();
+        _settingsStore = new SettingsStore(_paths);
+        _settings = _settingsStore.Load();
         _text = new Localizer(() => _settings);
-        _reader = new SoraV2BatteryReader();
         _sound = new AlertSoundService(_paths, () => _settings);
         _history = new BatteryHistoryStore(_paths);
+        _diagnostics = new DiagnosticsExporter(_paths, () => _settings, CreateDiagnosticsState);
+        _profileProvider = new KnownDeviceProfileProvider(_paths);
+        _candidateCollector = new BatteryCandidateCollector(_paths);
+        _draftImporter = new ProfileDraftImporter(_paths, _profileProvider);
+        _providerManager = new BatteryProviderManager(new IBatteryProvider[] { new NinjutsoSoraOfficialProvider(), new CompxBatteryProvider(), _profileProvider });
 
-        _contextMenu = new ContextMenuStrip { Font = new Font("Microsoft YaHei UI", 9F) };
-        _contextMenu.Closing += KeepSoundMenuOpenWhenPreviewing;
-        BuildContextMenu();
+        if (_settings.StartupWithWindows)
+            StartupManager.SetEnabled(true);
+
+        _menu = new ContextMenuStrip { Font = new Font("Microsoft YaHei UI", 9F) };
+        _menu.Closing += KeepSoundMenuOpenWhenPreviewing;
+        BuildMenu();
 
         _notifyIcon = new NotifyIcon
         {
             Icon = LoadAppIcon(),
             Text = "Sora V2 Battery Tip",
             Visible = true,
-            ContextMenuStrip = _contextMenu
+            ContextMenuStrip = _menu
         };
         _notifyIcon.MouseClick += async (_, e) =>
         {
             if (e.Button == MouseButtons.Left)
                 await CheckNowAsync(clearOnMissing: true, updateUi: true);
             else if (e.Button == MouseButtons.Right)
-                BuildContextMenu();
+                BuildMenu();
         };
 
         _pollTimer = new System.Windows.Forms.Timer();
         _pollTimer.Tick += async (_, _) => await CheckNowAsync(clearOnMissing: true, updateUi: true);
 
-        _uiInvoker = new Control();
-        _uiInvoker.CreateControl();
-        _deviceChangeWindow = new DeviceChangeWindow(OnHidDeviceInterfaceChanged);
+        _ui = new Control();
+        _ui.CreateControl();
+        _deviceChangeWindow = new DeviceChangeWindow(OnDeviceChanged);
 
         ApplyTimerInterval();
         _ = CheckNowAsync(clearOnMissing: true, updateUi: true);
     }
 
-    private void BuildContextMenu()
+    private void BuildMenu()
     {
-        _contextMenu.Items.Clear();
-        _statusItem = new ToolStripMenuItem(_statusText) { Enabled = false };
-        _statusItem.ForeColor = _isCableConnected ? Color.ForestGreen : SystemColors.ControlText;
+        _menu.Items.Clear();
+        _statusItem = new ToolStripMenuItem(_statusText) { Enabled = false, ForeColor = _isCableConnected ? Color.ForestGreen : SystemColors.ControlText };
+        _menu.Items.Add(_statusItem);
+        if (_lastReadings.Count > 1)
+        {
+            foreach (var reading in _lastReadings)
+                _menu.Items.Add(new ToolStripMenuItem(FormatDeviceReading(reading)) { Enabled = false, ForeColor = IsReadingCharging(reading) ? Color.ForestGreen : SystemColors.ControlText });
+        }
+        _menu.Items.Add(new ToolStripSeparator());
+        _menu.Items.Add(new ToolStripMenuItem(_text["CheckNow"], null, async (_, _) => await CheckNowAsync(clearOnMissing: true, updateUi: true)));
+        if (!_isDetected)
+            _menu.Items.Add(new ToolStripMenuItem(_text["AutoSetupUnknownMouse"], null, async (_, _) => await AutoSetupUnknownMouse()));
+        _menu.Items.Add(new ToolStripMenuItem(_text["BatteryHistory"], null, (_, _) => ShowBatteryHistoryWindow()));
+        _menu.Items.Add(new ToolStripMenuItem(_text["TestSound"], null, (_, _) => _sound.PlayCurrent()));
+        _menu.Items.Add(BuildDeviceProfilesMenu());
+        _menu.Items.Add(new ToolStripSeparator());
+        _menu.Items.Add(new ToolStripMenuItem($"{_text["LastCheck"]}: {(_lastCheckLocal.HasValue ? _lastCheckLocal.Value.ToString("HH:mm:ss") : _text["Never"])}") { Enabled = false });
+        _menu.Items.Add(new ToolStripMenuItem($"{_text["Source"]}: {_lastSource}") { Enabled = false });
+        if (!string.IsNullOrWhiteSpace(_lastFailureReason))
+            _menu.Items.Add(new ToolStripMenuItem($"{_text["FailureReason"]}: {LocalizeFailure(_lastFailureReason)}") { Enabled = false });
+        _menu.Items.Add(new ToolStripSeparator());
+        _menu.Items.Add(BuildNumberMenu(_text["Threshold"], _settings.AlertThreshold, new[] { 5, 10, 15, 20 }, "%", value => SaveSettings(settings => settings.AlertThreshold = value)));
+        _menu.Items.Add(BuildNumberMenu(_text["Interval"], _settings.PollingIntervalMinutes, new[] { 5, 10, 15, 30 }, " min", value => SaveSettings(settings => settings.PollingIntervalMinutes = value)));
+        _menu.Items.Add(BuildNumberMenu(_text["Cooldown"], _settings.AlertCooldownMinutes, new[] { 5, 10, 15, 30 }, " min", value => SaveSettings(settings => settings.AlertCooldownMinutes = value)));
+        _menu.Items.Add(BuildSoundMenu());
+        _menu.Items.Add(BuildLanguageMenu());
 
-        _contextMenu.Items.Add(_statusItem);
-        _contextMenu.Items.Add(new ToolStripSeparator());
-        _contextMenu.Items.Add(new ToolStripMenuItem(_text["CheckNow"], null, async (_, _) => await CheckNowAsync(clearOnMissing: true, updateUi: true)));
-        _contextMenu.Items.Add(new ToolStripMenuItem(_text["BatteryHistory"], null, (_, _) => ShowBatteryHistoryWindow()));
-        _contextMenu.Items.Add(new ToolStripMenuItem(_text["TestSound"], null, (_, _) => _sound.PlayCurrent()));
-        _contextMenu.Items.Add(new ToolStripSeparator());
-        _contextMenu.Items.Add(BuildNumberMenu(_text["Threshold"], _settings.AlertThreshold, new[] { 5, 10, 15, 20 }, "%", v => UpdateSettings(s => s.AlertThreshold = v)));
-        _contextMenu.Items.Add(BuildNumberMenu(_text["Interval"], _settings.PollingIntervalMinutes, new[] { 5, 10, 15, 30 }, " min", v => UpdateSettings(s => s.PollingIntervalMinutes = v)));
-        _contextMenu.Items.Add(BuildNumberMenu(_text["Cooldown"], _settings.AlertCooldownMinutes, new[] { 5, 10, 15, 30 }, " min", v => UpdateSettings(s => s.AlertCooldownMinutes = v)));
-        _contextMenu.Items.Add(BuildSoundMenu());
-        _contextMenu.Items.Add(BuildLanguageMenu());
+        var startup = new ToolStripMenuItem(_text["Startup"]) { Checked = _settings.StartupWithWindows };
+        startup.Click += (_, _) =>
+        {
+            var enabled = !_settings.StartupWithWindows;
+            SaveSettings(settings => settings.StartupWithWindows = enabled);
+            StartupManager.SetEnabled(enabled);
+        };
+        _menu.Items.Add(startup);
 
-        var startupItem = new ToolStripMenuItem(_text["Startup"]) { Checked = _settings.StartupWithWindows };
-        startupItem.Click += (_, _) => UpdateSettings(s => s.StartupWithWindows = !s.StartupWithWindows);
-        _contextMenu.Items.Add(startupItem);
-
-        _contextMenu.Items.Add(new ToolStripSeparator());
-        _contextMenu.Items.Add(new ToolStripMenuItem(_text["Uninstall"], null, (_, _) => ConfirmUninstall()));
-        _contextMenu.Items.Add(new ToolStripMenuItem(_text["Exit"], null, (_, _) => ExitThread()));
+        _menu.Items.Add(new ToolStripSeparator());
+        _menu.Items.Add(new ToolStripMenuItem(_text["Uninstall"], null, (_, _) => ConfirmUninstall()));
+        _menu.Items.Add(new ToolStripMenuItem(_text["Exit"], null, (_, _) => ExitThread()));
     }
 
     private ToolStripMenuItem BuildNumberMenu(string label, int current, int[] values, string suffix, Action<int> setter)
@@ -114,16 +145,120 @@ internal sealed class TrayAppContext : ApplicationContext
         return menu;
     }
 
-    private void ShowBatteryHistoryWindow()
+    private ToolStripMenuItem BuildDeviceProfilesMenu()
     {
-        if (_historyWindow == null || _historyWindow.IsDisposed)
-            _historyWindow = new BatteryHistoryWindow(_history, _text);
-        else
-            _historyWindow.Reload();
+        var statuses = _profileProvider.GetProfileStatus();
+        var validCount = statuses.Count(status => status.IsValid);
+        var invalidCount = statuses.Count(status => !status.IsValid);
+        var menu = new ToolStripMenuItem(_text["DeviceProfiles"]);
+        menu.DropDownItems.Add(new ToolStripMenuItem($"{_text["LoadedProfiles"]}: {validCount}") { Enabled = false });
+        menu.DropDownItems.Add(new ToolStripMenuItem($"{_text["InvalidProfiles"]}: {invalidCount}") { Enabled = false });
+        menu.DropDownItems.Add(new ToolStripSeparator());
+        menu.DropDownItems.Add(new ToolStripMenuItem(_text["OpenProfilesFolder"], null, (_, _) => _paths.OpenProfilesDirectory()));
+        menu.DropDownItems.Add(new ToolStripMenuItem(_text["ReloadProfiles"], null, (_, _) => ReloadProfiles()));
+        menu.DropDownItems.Add(new ToolStripMenuItem(_text["AutoSetupUnknownMouse"], null, async (_, _) => await AutoSetupUnknownMouse()));
+        menu.DropDownItems.Add(new ToolStripMenuItem(_text["ImportLatestDrafts"], null, (_, _) => ImportLatestDrafts()));
+        menu.DropDownItems.Add(new ToolStripMenuItem(_text["ExportDiagnostics"], null, (_, _) => ExportDiagnostics()));
+        return menu;
+    }
 
-        _historyWindow.Show();
-        _historyWindow.WindowState = FormWindowState.Normal;
-        _historyWindow.Activate();
+    private void ReloadProfiles()
+    {
+        _profileProvider.ReloadProfiles();
+        try { _notifyIcon.ShowBalloonTip(1800, _text["DeviceProfiles"], _text["ProfilesReloaded"], ToolTipIcon.Info); }
+        catch { }
+        BuildMenu();
+    }
+
+    private void ImportLatestDrafts()
+    {
+        var result = _draftImporter.ImportLatestVerifiedDrafts();
+        _profileProvider.ReloadProfiles();
+        var message = result.Total == 0
+            ? _text["NoDraftsFound"]
+            : $"{_text[result.MessageKey]}: {result.Imported}/{result.Total}, rejected: {result.Rejected}";
+        try { _notifyIcon.ShowBalloonTip(3000, _text["DeviceProfiles"], message, result.Imported > 0 ? ToolTipIcon.Info : ToolTipIcon.Warning); }
+        catch { }
+        BuildMenu();
+    }
+
+    private async Task AutoSetupUnknownMouse()
+    {
+        var officialBattery = PromptOfficialBatteryPercentage();
+        if (!officialBattery.HasValue)
+            return;
+
+        string? dir = null;
+        try
+        {
+            SetStatusText(_text["AutoSetupRunning"]);
+            dir = _candidateCollector.Collect(officialBattery.Value);
+            var result = _draftImporter.ImportVerifiedDraftsProgressive(dir);
+            _profileProvider.ReloadProfiles();
+
+            if (result.Imported > 0)
+            {
+                var readOk = await CheckNowAsync(clearOnMissing: true, updateUi: true);
+                var message = readOk
+                    ? $"{_text["AutoSetupSuccess"]}: {result.Imported}/{result.Total}, ±{result.ToleranceUsed}%"
+                    : $"{_text["AutoSetupImportedButReadFailed"]}: {result.Imported}/{result.Total}, ±{result.ToleranceUsed}%";
+                try { _notifyIcon.ShowBalloonTip(3000, _text["DeviceProfiles"], message, readOk ? ToolTipIcon.Info : ToolTipIcon.Warning); }
+                catch { }
+            }
+            else
+            {
+                var message = $"{_text["AutoSetupFailed"]}: {result.Rejected}/{result.Total}";
+                try { _notifyIcon.ShowBalloonTip(3500, _text["DeviceProfiles"], message, ToolTipIcon.Warning); }
+                catch { }
+                TryOpenDirectory(dir);
+            }
+        }
+        catch
+        {
+            try { _notifyIcon.ShowBalloonTip(3500, _text["DeviceProfiles"], _text["AutoSetupFailed"], ToolTipIcon.Error); }
+            catch { }
+            if (!string.IsNullOrWhiteSpace(dir))
+                TryOpenDirectory(dir);
+        }
+        finally
+        {
+            BuildMenu();
+        }
+    }
+
+    private int? PromptOfficialBatteryPercentage()
+    {
+        using var form = new Form
+        {
+            Text = _text["AutoSetupUnknownMouse"],
+            StartPosition = FormStartPosition.CenterScreen,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ClientSize = new Size(420, 128),
+            Font = new Font("Microsoft YaHei UI", 9F)
+        };
+        var label = new Label { Text = _text["OfficialBatteryPrompt"], AutoSize = false, Left = 14, Top = 16, Width = 390, Height = 24 };
+        var input = new NumericUpDown { Left = 18, Top = 48, Width = 120, Minimum = 1, Maximum = 100, Value = Math.Clamp(_lastBatteryPercentage ?? 50, 1, 100) };
+        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Left = 236, Top = 84, Width = 80 };
+        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Left = 326, Top = 84, Width = 80 };
+        form.Controls.Add(label);
+        form.Controls.Add(input);
+        form.Controls.Add(ok);
+        form.Controls.Add(cancel);
+        form.AcceptButton = ok;
+        form.CancelButton = cancel;
+
+        if (form.ShowDialog() != DialogResult.OK)
+            return null;
+
+        return (int)input.Value;
+    }
+
+    private static void TryOpenDirectory(string directory)
+    {
+        try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(directory) { UseShellExecute = true }); }
+        catch { }
     }
 
     private ToolStripMenuItem BuildSoundMenu()
@@ -132,14 +267,22 @@ internal sealed class TrayAppContext : ApplicationContext
         menu.DropDown.Closing += KeepSoundMenuOpenWhenPreviewing;
         menu.DropDownItems.Add(BuildVolumeMenu());
         menu.DropDownItems.Add(new ToolStripSeparator());
+
         foreach (var sound in _sound.GetSounds())
         {
             var file = sound;
             var label = file.Equals("default.wav", StringComparison.OrdinalIgnoreCase) ? _text["Default"] : Path.GetFileNameWithoutExtension(file);
             var item = new ToolStripMenuItem(label) { Checked = file.Equals(_settings.AlertSoundFile, StringComparison.OrdinalIgnoreCase), Tag = file };
-            item.Click += (_, _) => SelectSound(file);
+            item.Click += (_, _) =>
+            {
+                KeepSoundMenuOpenBriefly();
+                SaveSettings(settings => settings.AlertSoundFile = file);
+                RefreshSoundMenuChecks();
+                _sound.PlayCurrent();
+            };
             menu.DropDownItems.Add(item);
         }
+
         menu.DropDownItems.Add(new ToolStripSeparator());
         menu.DropDownItems.Add(new ToolStripMenuItem(_text["OpenFolder"], null, (_, _) => _sound.OpenFolder()));
         return menu;
@@ -153,262 +296,89 @@ internal sealed class TrayAppContext : ApplicationContext
         {
             var value = volume;
             var item = new ToolStripMenuItem($"{value}%") { Checked = _settings.AlertVolume == value };
-            item.Click += (_, _) => SelectVolume(value);
+            item.Click += (_, _) =>
+            {
+                KeepSoundMenuOpenBriefly();
+                SaveSettings(settings => settings.AlertVolume = value);
+                RefreshSoundMenuChecks();
+                _sound.PlayCurrent();
+            };
             menu.DropDownItems.Add(item);
         }
         return menu;
     }
 
-    private void SelectSound(string file)
-    {
-        KeepSoundMenuOpenBriefly();
-        UpdateSettings(s => s.AlertSoundFile = file);
-        RefreshOpenSoundMenuChecks();
-        _sound.PlayCurrent();
-    }
-
-    private void SelectVolume(int volume)
-    {
-        KeepSoundMenuOpenBriefly();
-        UpdateSettings(s => s.AlertVolume = volume);
-        RefreshOpenSoundMenuChecks();
-        _sound.PlayCurrent();
-    }
-
-    private void KeepSoundMenuOpenBriefly()
-    {
-        _keepSoundMenuOpenAfterClick = true;
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(250);
-            try
-            {
-                if (!_uiInvoker.IsDisposed && _uiInvoker.IsHandleCreated)
-                    _uiInvoker.BeginInvoke((MethodInvoker)(() => _keepSoundMenuOpenAfterClick = false));
-            }
-            catch { }
-        });
-    }
-
-    private void KeepSoundMenuOpenWhenPreviewing(object? sender, ToolStripDropDownClosingEventArgs e)
-    {
-        if (_keepSoundMenuOpenAfterClick && e.CloseReason == ToolStripDropDownCloseReason.ItemClicked)
-            e.Cancel = true;
-    }
-
-    private void RefreshOpenSoundMenuChecks()
-    {
-        foreach (ToolStripItem item in _contextMenu.Items)
-        {
-            if (item is ToolStripMenuItem root && root.Text == _text["Sound"])
-                RefreshSoundMenuChecks(root);
-        }
-    }
-
-    private void RefreshSoundMenuChecks(ToolStripMenuItem soundRoot)
-    {
-        foreach (ToolStripItem item in soundRoot.DropDownItems)
-        {
-            if (item is ToolStripMenuItem child)
-            {
-                if (child.DropDownItems.Count > 0)
-                {
-                    foreach (ToolStripItem volumeItem in child.DropDownItems)
-                    {
-                        if (volumeItem is ToolStripMenuItem volumeMenuItem && int.TryParse((volumeMenuItem.Text ?? string.Empty).TrimEnd('%'), out var volume))
-                            volumeMenuItem.Checked = volume == _settings.AlertVolume;
-                    }
-                    child.Text = $"{_text["Sound"]} {_settings.AlertVolume}%";
-                }
-                else if (child.Tag is string soundFile)
-                {
-                    child.Checked = soundFile.Equals(_settings.AlertSoundFile, StringComparison.OrdinalIgnoreCase);
-                }
-            }
-        }
-    }
-
     private ToolStripMenuItem BuildLanguageMenu()
     {
         var menu = new ToolStripMenuItem(_text["Language"]);
-        AddLanguageItem(menu, "Auto", "auto");
-        AddLanguageItem(menu, "zh-CN", "zh-CN");
-        AddLanguageItem(menu, "English", "en-US");
+        foreach (var pair in new[] { ("Auto", "auto"), ("zh-CN", "zh-CN"), ("English", "en-US") })
+        {
+            var value = pair.Item2;
+            var item = new ToolStripMenuItem(pair.Item1) { Checked = _settings.Language.Equals(value, StringComparison.OrdinalIgnoreCase) };
+            item.Click += (_, _) => SaveSettings(settings => settings.Language = value);
+            menu.DropDownItems.Add(item);
+        }
         return menu;
     }
 
-    private void AddLanguageItem(ToolStripMenuItem menu, string label, string value)
+    private void SaveSettings(Action<AppSettings> update)
     {
-        var item = new ToolStripMenuItem(label) { Checked = _settings.Language.Equals(value, StringComparison.OrdinalIgnoreCase) };
-        item.Click += (_, _) => UpdateSettings(s => s.Language = value);
-        menu.DropDownItems.Add(item);
-    }
-
-    private void UpdateSettings(Action<AppSettings> mutate)
-    {
-        mutate(_settings);
-        _store.Save(_settings);
+        update(_settings);
+        _settingsStore.Save(_settings);
         ApplyTimerInterval();
         RenderTrayState();
     }
 
-    private void ConfirmUninstall()
+    private void ShowBatteryHistoryWindow()
     {
-        var result = MessageBox.Show(
-            _text["UninstallConfirm"],
-            _text["UninstallTitle"],
-            MessageBoxButtons.YesNo,
-            MessageBoxIcon.Warning,
-            MessageBoxDefaultButton.Button2);
-        if (result != DialogResult.Yes)
-            return;
-        BeginUninstall();
+        if (_historyWindow == null || _historyWindow.IsDisposed)
+            _historyWindow = new BatteryHistoryWindow(_history, _text);
+        else
+            _historyWindow.Reload();
+
+        _historyWindow.Show();
+        _historyWindow.WindowState = FormWindowState.Normal;
+        _historyWindow.Activate();
     }
 
-    private void BeginUninstall()
+    private void ExportDiagnostics()
     {
-        try
-        {
-            _settings.StartupWithWindows = false;
-            StartupManager.SetEnabled(false);
-            CleanRegistryRecords();
-            if (Directory.Exists(_paths.DataDirectory))
-                Directory.Delete(_paths.DataDirectory, recursive: true);
-        }
+        var dir = _diagnostics.Export();
+        try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(dir) { UseShellExecute = true }); }
         catch { }
-
-        try
-        {
-            _notifyIcon.ShowBalloonTip(2500, _text["UninstallStartedTitle"], _text["UninstallStarted"], ToolTipIcon.Info);
-        }
-        catch { }
-
-        LaunchSelfCleanupAfterExit();
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(1200);
-            try
-            {
-                if (!_uiInvoker.IsDisposed && _uiInvoker.IsHandleCreated)
-                    _uiInvoker.BeginInvoke((MethodInvoker)(() => ExitThread()));
-                else
-                    ExitThread();
-            }
-            catch
-            {
-                ExitThread();
-            }
-        });
-    }
-
-    private void LaunchSelfCleanupAfterExit()
-    {
-        var appDir = Path.GetFullPath(AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-        if (!IsSafeAppDirectory(appDir))
-            return;
-
-        var script = "$ErrorActionPreference='SilentlyContinue';"
-            + $"Wait-Process -Id {Environment.ProcessId} -Timeout 30;"
-            + "Start-Sleep -Milliseconds 500;"
-            + $"Remove-Item -LiteralPath '{appDir.Replace("'", "''")}' -Recurse -Force;";
-        var encoded = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(script));
-        try
-        {
-            var needsElevation = IsUnderProgramFiles(appDir);
-            var startInfo = new System.Diagnostics.ProcessStartInfo("powershell.exe", $"-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {encoded}")
-            {
-                UseShellExecute = needsElevation,
-                CreateNoWindow = !needsElevation,
-                WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden,
-                WorkingDirectory = Path.GetTempPath()
-            };
-            if (needsElevation)
-                startInfo.Verb = "runas";
-            System.Diagnostics.Process.Start(startInfo);
-        }
+        try { _notifyIcon.ShowBalloonTip(2500, _text["DiagnosticsDone"], dir, ToolTipIcon.Info); }
         catch { }
     }
 
-    private static bool IsSafeAppDirectory(string appDir)
+    private object CreateDiagnosticsState() => new
     {
-        if (string.IsNullOrWhiteSpace(appDir))
-            return false;
-        var root = Path.GetPathRoot(appDir);
-        if (string.Equals(root?.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), appDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), StringComparison.OrdinalIgnoreCase))
-            return false;
-        return File.Exists(Path.Combine(appDir, "SoraV2BatteryTip.exe")) || File.Exists(Path.Combine(appDir, "MouseBatteryGuard.exe"));
-    }
-
-    private static bool IsUnderProgramFiles(string appDir)
-    {
-        return IsChildOf(appDir, Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles))
-            || IsChildOf(appDir, Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86));
-    }
-
-    private static bool IsChildOf(string child, string parent)
-    {
-        if (string.IsNullOrWhiteSpace(child) || string.IsNullOrWhiteSpace(parent))
-            return false;
-        var childFull = Path.GetFullPath(child).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        var parentFull = Path.GetFullPath(parent).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        return childFull.StartsWith(parentFull, StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static void CleanRegistryRecords()
-    {
-        DeleteRegistryValue(@"Software\Microsoft\Windows\CurrentVersion\Run", "SoraV2BatteryTip");
-        DeleteRegistryValue(@"Software\Microsoft\Windows\CurrentVersion\Run", "MouseBatteryGuard");
-        DeleteRegistryValue(@"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", "SoraV2BatteryTip");
-        DeleteRegistryValue(@"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", "MouseBatteryGuard");
-        DeleteNotifyIconSettings();
-    }
-
-    private static void DeleteRegistryValue(string path, string valueName)
-    {
-        try
+        timestampLocal = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+        detected = _isDetected,
+        cableConnected = _isCableConnected,
+        batteryPercentage = _lastBatteryPercentage,
+        batteryBucket = _lastBatteryBucket,
+        lastCheckLocal = _lastCheckLocal?.ToString("yyyy-MM-dd HH:mm:ss"),
+        source = _lastSource,
+        failureReason = _lastFailureReason,
+        builtInSoraV2Provider = "official-hid",
+        providers = _providerManager.GetProviderStatus(),
+        profiles = _profileProvider.GetProfileStatus(),
+        readings = _lastReadings.Select(reading => new
         {
-            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(path, writable: true);
-            key?.DeleteValue(valueName, throwOnMissingValue: false);
-        }
-        catch { }
-    }
+            reading.DeviceName,
+            reading.VendorId,
+            reading.ProductId,
+            reading.BatteryPercentage,
+            reading.IsCharging,
+            reading.IsCableConnected,
+            reading.Source
+        }).ToArray(),
+        processId = Environment.ProcessId
+    };
 
-    private static void DeleteNotifyIconSettings()
+    private async Task<bool> CheckNowAsync(bool clearOnMissing, bool updateUi)
     {
-        try
-        {
-            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Control Panel\NotifyIconSettings", writable: true);
-            if (key == null)
-                return;
-            foreach (var subKeyName in key.GetSubKeyNames())
-            {
-                using var subKey = key.OpenSubKey(subKeyName);
-                var executablePath = subKey?.GetValue("ExecutablePath") as string ?? string.Empty;
-                if (IsOurExecutablePath(executablePath))
-                    key.DeleteSubKeyTree(subKeyName, throwOnMissingSubKey: false);
-            }
-        }
-        catch { }
-    }
-
-    private static bool IsOurExecutablePath(string executablePath)
-    {
-        if (string.IsNullOrWhiteSpace(executablePath))
-            return false;
-        try
-        {
-            if (string.Equals(Path.GetFileName(executablePath), "SoraV2BatteryTip.exe", StringComparison.OrdinalIgnoreCase) || string.Equals(Path.GetFileName(executablePath), "MouseBatteryGuard.exe", StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-        catch { }
-        return executablePath.Contains("SoraV2BatteryTip", StringComparison.OrdinalIgnoreCase) || executablePath.Contains("MouseBatteryGuard", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private async Task<bool> CheckNowAsync(bool clearOnMissing, bool waitForCurrent = false, bool updateUi = true)
-    {
-        if (waitForCurrent)
-            await _checkGate.WaitAsync();
-        else if (!await _checkGate.WaitAsync(0))
+        if (!await _checkGate.WaitAsync(0))
             return false;
 
         try
@@ -416,14 +386,21 @@ internal sealed class TrayAppContext : ApplicationContext
             if (updateUi)
                 SetStatusText(_text["Checking"]);
 
-            var reading = await _reader.ReadAsync(CancellationToken.None);
-            if (reading != null)
+            var result = await _providerManager.ReadAllAsync(CancellationToken.None);
+            _lastCheckLocal = DateTime.Now;
+            _lastSource = result.Source;
+            _lastFailureReason = result.FailureReason;
+
+            if (result.Readings.Count > 0)
             {
-                ApplyReading(reading);
-                _history.Append("detected", reading);
+                ApplyReadings(result.Readings);
+                foreach (var reading in result.Readings)
+                    _history.Append("detected", reading);
                 if (updateUi)
                     RenderTrayState();
-                MaybePlayAlert(reading);
+                var alertReading = SelectAlertReading(result.Readings);
+                if (alertReading != null)
+                    MaybePlayAlert(alertReading);
                 return true;
             }
 
@@ -440,49 +417,67 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private void ApplyReading(BatteryReading reading)
     {
-        _lastReading = reading;
-        _isDetected = true;
-        _isCableConnected = reading.IsCableConnected;
-        if (reading.HasBatteryPercentage && reading.BatteryPercentage is >= 1 and <= 100)
+        ApplyReadings(new[] { reading });
+    }
+
+    private void ApplyReadings(IReadOnlyList<BatteryReading> readings)
+    {
+        var validReadings = readings
+            .Where(reading => reading.HasBatteryPercentage && reading.BatteryPercentage is >= 1 and <= 100)
+            .OrderBy(reading => reading.BatteryPercentage)
+            .ThenBy(reading => ShortDeviceName(reading))
+            .ToArray();
+
+        if (validReadings.Length == 0)
         {
-            _lastBatteryPercentage = reading.BatteryPercentage;
-            _lastBatteryBucket = ToBatteryBucket(reading.BatteryPercentage);
+            ApplyMissingReading(clearOnMissing: true);
+            return;
         }
+
+        var iconReading = SelectIconReading(validReadings);
+        _lastReadings = validReadings;
+        _lastReading = iconReading;
+        _isDetected = true;
+        _isCableConnected = validReadings.All(IsReadingCharging);
+        _lastBatteryPercentage = iconReading.BatteryPercentage;
+        _lastBatteryBucket = ToBatteryBucket(iconReading.BatteryPercentage);
     }
 
     private void ApplyMissingReading(bool clearOnMissing)
     {
-        var connection = _reader.DetectConnection();
-        if (connection.WiredPresent)
+        var connection = default(DeviceConnection);
+        _isCableConnected = connection.IsCableConnected;
+        _isDetected = connection.IsDetected || (!clearOnMissing && _lastBatteryBucket.HasValue);
+
+        if (!_isDetected)
         {
-            _isDetected = true;
-            _isCableConnected = true;
+            _lastReadings = Array.Empty<BatteryReading>();
+            _lastReading = null;
             return;
         }
 
-        if (connection.WirelessPresent || (!clearOnMissing && _lastBatteryBucket.HasValue))
+        if (_lastReading != null)
         {
-            _isDetected = true;
-            _isCableConnected = false;
-            if (_lastReading != null)
+            _lastReading = new BatteryReading
             {
-                _lastReading = new BatteryReading
-                {
-                    BatteryPercentage = _lastBatteryPercentage ?? _lastReading.BatteryPercentage,
-                    HasBatteryPercentage = _lastBatteryPercentage.HasValue || _lastReading.HasBatteryPercentage,
-                    IsCharging = false,
-                    IsFullyCharged = false,
-                    IsOnline = connection.WirelessPresent,
-                    IsCableConnected = false,
-                    Source = _lastReading.Source
-                };
-            }
-            return;
+                BatteryPercentage = _lastBatteryPercentage ?? _lastReading.BatteryPercentage,
+                IsCharging = false,
+                IsFullyCharged = false,
+                IsOnline = connection.WirelessPresent,
+                IsCableConnected = connection.IsCableConnected,
+                Source = _lastReading.Source
+            };
+            _lastReadings = new[] { _lastReading };
         }
+    }
 
-        _isDetected = false;
-        _isCableConnected = false;
-        _lastReading = null;
+    private void OnDeviceChanged(string devicePath, bool arrived)
+    {
+        if (string.IsNullOrWhiteSpace(devicePath))
+            return;
+
+        if (devicePath.Contains("hid#", StringComparison.OrdinalIgnoreCase))
+            _ = CheckNowAsync(clearOnMissing: true, updateUi: true);
     }
 
     private void RenderTrayState()
@@ -493,12 +488,30 @@ internal sealed class TrayAppContext : ApplicationContext
             return;
         }
 
+        if (_lastFailureReason == "read_failed" && _lastBatteryPercentage.HasValue)
+        {
+            var text = $"SORA V2: {_lastBatteryPercentage.Value}% ({LocalizeFailure(_lastFailureReason)})";
+            SetStatusText(text);
+            SetTrayText(TrimTrayText(text));
+            UpdateIcon(cableConnected: _isCableConnected, batteryBucket: _lastBatteryBucket ?? 100);
+            return;
+        }
+
+        if (_lastReadings.Count > 1)
+        {
+            var text = $"{MouseCountLabel(_lastReadings.Count)}: {string.Join(" / ", _lastReadings.Select(FormatCompactReading))}";
+            SetStatusText(text);
+            SetTrayText(TrimTrayText(text));
+            UpdateIcon(cableConnected: _isCableConnected, batteryBucket: _lastBatteryBucket ?? 100);
+            return;
+        }
+
         if (_isCableConnected)
         {
             var battery = _lastBatteryPercentage.HasValue ? $"{_lastBatteryPercentage.Value}% " : string.Empty;
             var text = $"SORA V2: {battery}{_text["Charging"]}";
             SetStatusText(text);
-            SetTrayText(text.Length <= 63 ? text : text[..63]);
+            SetTrayText(TrimTrayText(text));
             UpdateIcon(cableConnected: true, batteryBucket: _lastBatteryBucket ?? 100);
             return;
         }
@@ -507,7 +520,7 @@ internal sealed class TrayAppContext : ApplicationContext
         {
             var text = _lastBatteryPercentage.HasValue ? $"SORA V2: {_lastBatteryPercentage.Value}%" : "SORA V2";
             SetStatusText(text);
-            SetTrayText(text.Length <= 63 ? text : text[..63]);
+            SetTrayText(TrimTrayText(text));
             UpdateIcon(cableConnected: false, batteryBucket: _lastBatteryBucket.Value);
             return;
         }
@@ -522,10 +535,16 @@ internal sealed class TrayAppContext : ApplicationContext
         SetDefaultIcon();
     }
 
+    private string LocalizeFailure(string reason)
+    {
+        var localized = _text[$"Failure_{reason}"];
+        return localized == $"Failure_{reason}" ? reason : localized;
+    }
+
     private void SetStatusText(string text)
     {
         _statusText = text;
-        if (_statusItem != null && !_statusItem.IsDisposed)
+        if (_statusItem is { IsDisposed: false })
         {
             _statusItem.Text = text;
             _statusItem.ForeColor = _isCableConnected ? Color.ForestGreen : SystemColors.ControlText;
@@ -544,52 +563,10 @@ internal sealed class TrayAppContext : ApplicationContext
     {
         try
         {
-            if (!_uiInvoker.IsDisposed && _uiInvoker.IsHandleCreated)
-                _uiInvoker.BeginInvoke(RenderTrayState);
+            if (!_ui.IsDisposed && _ui.IsHandleCreated)
+                _ui.BeginInvoke(RenderTrayState);
         }
         catch { }
-    }
-
-    private void OnHidDeviceInterfaceChanged(string devicePath, bool arrived)
-    {
-        if (string.IsNullOrWhiteSpace(devicePath))
-            return;
-
-        if (devicePath.Contains("vid_1915&pid_ae12", StringComparison.OrdinalIgnoreCase))
-        {
-            _isDetected = arrived || _lastBatteryBucket.HasValue;
-            _isCableConnected = arrived;
-            if (!arrived && _lastReading != null)
-            {
-                _lastReading = new BatteryReading
-                {
-                    BatteryPercentage = _lastBatteryPercentage ?? _lastReading.BatteryPercentage,
-                    HasBatteryPercentage = _lastBatteryPercentage.HasValue || _lastReading.HasBatteryPercentage,
-                    IsCharging = false,
-                    IsFullyCharged = false,
-                    IsOnline = true,
-                    IsCableConnected = false,
-                    Source = _lastReading.Source
-                };
-            }
-            PostRenderTrayState();
-            return;
-        }
-
-        if (devicePath.Contains("vid_1915&pid_ae1c", StringComparison.OrdinalIgnoreCase))
-        {
-            if (arrived)
-            {
-                _isDetected = true;
-                if (!_isCableConnected)
-                    _isCableConnected = false;
-            }
-            else if (!_isCableConnected)
-            {
-                _isDetected = _lastBatteryBucket.HasValue;
-            }
-            PostRenderTrayState();
-        }
     }
 
     private void MaybePlayAlert(BatteryReading reading)
@@ -615,16 +592,7 @@ internal sealed class TrayAppContext : ApplicationContext
         _sound.PlayCurrent();
     }
 
-    private int AlertLevelFor(int batteryPercentage)
-    {
-        if (batteryPercentage <= 3)
-            return 3;
-        if (batteryPercentage <= 5)
-            return 5;
-        if (batteryPercentage <= 10)
-            return 10;
-        return _settings.AlertThreshold;
-    }
+    private static int AlertLevelFor(int batteryPercentage) => Math.Clamp((batteryPercentage / 5) * 5, 0, 100);
 
     private void ApplyTimerInterval()
     {
@@ -633,11 +601,249 @@ internal sealed class TrayAppContext : ApplicationContext
         _pollTimer.Start();
     }
 
-    private static int ToBatteryBucket(int percentage)
+    private void KeepSoundMenuOpenBriefly()
     {
-        if (percentage >= 96)
-            return 100;
-        return Math.Clamp((int)Math.Round(percentage / 5d) * 5, 5, 100);
+        _keepSoundMenuOpen = true;
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(250);
+            try
+            {
+                if (!_ui.IsDisposed && _ui.IsHandleCreated)
+                    _ui.BeginInvoke((MethodInvoker)(() => _keepSoundMenuOpen = false));
+            }
+            catch { }
+        });
+    }
+
+    private void KeepSoundMenuOpenWhenPreviewing(object? sender, ToolStripDropDownClosingEventArgs e)
+    {
+        if (_keepSoundMenuOpen && e.CloseReason == ToolStripDropDownCloseReason.ItemClicked)
+            e.Cancel = true;
+    }
+
+    private void RefreshSoundMenuChecks()
+    {
+        foreach (ToolStripItem rootItem in _menu.Items)
+        {
+            if (rootItem is not ToolStripMenuItem root || root.Text != _text["Sound"])
+                continue;
+
+            foreach (ToolStripItem item in root.DropDownItems)
+            {
+                if (item is not ToolStripMenuItem child)
+                    continue;
+
+                if (child.DropDownItems.Count > 0)
+                {
+                    child.Text = $"{_text["Sound"]} {_settings.AlertVolume}%";
+                    foreach (ToolStripItem volumeItem in child.DropDownItems)
+                    {
+                        if (volumeItem is ToolStripMenuItem volumeMenuItem && int.TryParse((volumeMenuItem.Text ?? string.Empty).TrimEnd('%'), out var volume))
+                            volumeMenuItem.Checked = volume == _settings.AlertVolume;
+                    }
+                }
+                else if (child.Tag is string soundFile)
+                {
+                    child.Checked = soundFile.Equals(_settings.AlertSoundFile, StringComparison.OrdinalIgnoreCase);
+                }
+            }
+        }
+    }
+
+    private void ConfirmUninstall()
+    {
+        var result = MessageBox.Show(_text["UninstallConfirm"], _text["UninstallTitle"], MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+        if (result == DialogResult.Yes)
+            BeginUninstall();
+    }
+
+    private void BeginUninstall()
+    {
+        try
+        {
+            _settings.StartupWithWindows = false;
+            _settingsStore.Save(_settings);
+            StartupManager.SetEnabled(false);
+            CleanRegistryRecords();
+            if (Directory.Exists(_paths.DataDirectory))
+                Directory.Delete(_paths.DataDirectory, recursive: true);
+        }
+        catch { }
+
+        try { _notifyIcon.ShowBalloonTip(2500, _text["UninstallStartedTitle"], _text["UninstallStarted"], ToolTipIcon.Info); }
+        catch { }
+
+        LaunchSelfCleanupAfterExit();
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(1200);
+            try
+            {
+                if (!_ui.IsDisposed && _ui.IsHandleCreated)
+                    _ui.BeginInvoke((MethodInvoker)(ExitThread));
+                else
+                    ExitThread();
+            }
+            catch { ExitThread(); }
+        });
+    }
+
+    private void LaunchSelfCleanupAfterExit()
+    {
+        var appDir = Path.GetFullPath(AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        if (!IsSafeAppDirectory(appDir))
+            return;
+
+        var script = "$ErrorActionPreference='SilentlyContinue';"
+            + $"Wait-Process -Id {Environment.ProcessId} -Timeout 30;"
+            + "Start-Sleep -Milliseconds 500;"
+            + $"Remove-Item -LiteralPath '{appDir.Replace("'", "''")}' -Recurse -Force;";
+        var encoded = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(script));
+
+        try
+        {
+            var needsElevation = IsUnderProgramFiles(appDir);
+            var startInfo = new System.Diagnostics.ProcessStartInfo("powershell.exe", $"-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {encoded}")
+            {
+                UseShellExecute = needsElevation,
+                CreateNoWindow = !needsElevation,
+                WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden,
+                WorkingDirectory = Path.GetTempPath()
+            };
+            if (needsElevation)
+                startInfo.Verb = "runas";
+            System.Diagnostics.Process.Start(startInfo);
+        }
+        catch { }
+    }
+
+    private static void CleanRegistryRecords()
+    {
+        DeleteRegistryValue(@"Software\Microsoft\Windows\CurrentVersion\Run", "SoraV2BatteryTip");
+        DeleteRegistryValue(@"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", "SoraV2BatteryTip");
+        DeleteNotifyIconSettings();
+    }
+
+    private static void DeleteRegistryValue(string path, string valueName)
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(path, writable: true);
+            key?.DeleteValue(valueName, throwOnMissingValue: false);
+        }
+        catch { }
+    }
+
+    private static void DeleteNotifyIconSettings()
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Control Panel\NotifyIconSettings", writable: true);
+            if (key == null)
+                return;
+
+            foreach (var subKeyName in key.GetSubKeyNames())
+            {
+                using var subKey = key.OpenSubKey(subKeyName);
+                var executablePath = subKey?.GetValue("ExecutablePath") as string ?? string.Empty;
+                if (IsOurExecutablePath(executablePath))
+                    key.DeleteSubKeyTree(subKeyName, throwOnMissingSubKey: false);
+            }
+        }
+        catch { }
+    }
+
+    private static bool IsOurExecutablePath(string executablePath)
+    {
+        if (string.IsNullOrWhiteSpace(executablePath))
+            return false;
+        try
+        {
+            if (string.Equals(Path.GetFileName(executablePath), "SoraV2BatteryTip.exe", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        catch { }
+        return executablePath.Contains("SoraV2BatteryTip", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsSafeAppDirectory(string appDir)
+    {
+        if (string.IsNullOrWhiteSpace(appDir))
+            return false;
+        var root = Path.GetPathRoot(appDir);
+        if (string.Equals(root?.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), appDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), StringComparison.OrdinalIgnoreCase))
+            return false;
+        return File.Exists(Path.Combine(appDir, "SoraV2BatteryTip.exe"));
+    }
+
+    private static bool IsUnderProgramFiles(string appDir)
+    {
+        return IsChildOf(appDir, Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles))
+            || IsChildOf(appDir, Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86));
+    }
+
+    private static bool IsChildOf(string child, string parent)
+    {
+        if (string.IsNullOrWhiteSpace(child) || string.IsNullOrWhiteSpace(parent))
+            return false;
+        var childFull = Path.GetFullPath(child).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var parentFull = Path.GetFullPath(parent).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        return childFull.StartsWith(parentFull, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string TrimTrayText(string text) => text.Length <= 63 ? text : text[..63];
+    private static int ToBatteryBucket(int percentage) => Math.Clamp((percentage / 5) * 5, 5, 100);
+
+    private BatteryReading SelectIconReading(IReadOnlyList<BatteryReading> readings)
+    {
+        return readings
+            .Where(reading => !IsReadingCharging(reading))
+            .OrderBy(reading => reading.BatteryPercentage)
+            .FirstOrDefault()
+            ?? readings.OrderBy(reading => reading.BatteryPercentage).First();
+    }
+
+    private static BatteryReading? SelectAlertReading(IReadOnlyList<BatteryReading> readings)
+    {
+        return readings
+            .Where(reading => !IsReadingCharging(reading))
+            .OrderBy(reading => reading.BatteryPercentage)
+            .FirstOrDefault();
+    }
+
+    private static bool IsReadingCharging(BatteryReading reading)
+    {
+        return reading.IsCableConnected || reading.IsCharging || reading.IsFullyCharged;
+    }
+
+    private string MouseCountLabel(int count)
+    {
+        return _settings.Language.StartsWith("en", StringComparison.OrdinalIgnoreCase)
+            ? $"{count} mice"
+            : $"{count} 个鼠标";
+    }
+
+    private string FormatCompactReading(BatteryReading reading)
+    {
+        return IsReadingCharging(reading)
+            ? $"{reading.BatteryPercentage}% {_text["Charging"]}"
+            : $"{reading.BatteryPercentage}%";
+    }
+
+    private string FormatDeviceReading(BatteryReading reading)
+    {
+        return $"{ShortDeviceName(reading)}: {FormatCompactReading(reading)}";
+    }
+
+    private static string ShortDeviceName(BatteryReading reading)
+    {
+        var name = string.IsNullOrWhiteSpace(reading.DeviceName) ? reading.Source : reading.DeviceName;
+        name = name
+            .Replace("Wireless mouse", "Mouse", StringComparison.OrdinalIgnoreCase)
+            .Replace("NANO dongle", "Dongle", StringComparison.OrdinalIgnoreCase)
+            .Trim();
+        return name.Length <= 34 ? name : name[..34].TrimEnd();
     }
 
     private void UpdateIcon(bool cableConnected, int batteryBucket)
@@ -645,6 +851,7 @@ internal sealed class TrayAppContext : ApplicationContext
         var key = cableConnected ? "plugged" : $"battery:{batteryBucket}";
         if (string.Equals(_lastIconKey, key, StringComparison.Ordinal))
             return;
+
         _lastIconKey = key;
         var icon = CreateBatteryIcon(cableConnected ? 100 : batteryBucket, cableConnected);
         var previous = _dynamicIcon;
@@ -657,6 +864,7 @@ internal sealed class TrayAppContext : ApplicationContext
     {
         if (string.Equals(_lastIconKey, "default", StringComparison.Ordinal))
             return;
+
         _lastIconKey = "default";
         var icon = LoadAppIcon();
         var previous = _dynamicIcon;
@@ -734,9 +942,9 @@ internal sealed class TrayAppContext : ApplicationContext
         if (disposing)
         {
             _deviceChangeWindow.Dispose();
-            _uiInvoker.Dispose();
+            _ui.Dispose();
             _pollTimer.Dispose();
-            _contextMenu.Dispose();
+            _menu.Dispose();
             _historyWindow?.Dispose();
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
@@ -859,4 +1067,3 @@ internal static class GraphicsExtensions
         return path;
     }
 }
-

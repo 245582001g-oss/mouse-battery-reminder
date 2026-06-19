@@ -2,38 +2,88 @@
 
 [English](README.md) | 简体中文
 
-一个极简 Windows 托盘工具，用于显示 Ninjutso SORA V2 鼠标电量状态，并在低电量时播放提示音。
+一个轻量级 Windows 托盘工具，用于显示无线游戏鼠标电量，并在低电量时播放提示音。
 
 最初目标很简单：打游戏时，不要等鼠标突然没电、失去控制之后才发现电量不足。
 
 ## 当前状态
 
-- 当前稳定支持设备：**Ninjutso SORA V2**。
-- 当前版本通过 Windows HID 设备接口通知同步判断 SORA V2 插线 / 无线状态。
-- 电量百分比通过开发过程中确认的 SORA V2 HID Feature Report 路径读取。
-- 当前项目**还不是通用无线鼠标电量读取工具**。
+这个项目**目前还不是通用无线鼠标电量读取工具**。当前版本重点支持两个已经验证过的设备族，同时保留本地 profile / 自动学习流程作为备用方案。
 
-## 为什么开源
+已验证 / 部分支持：
 
-Windows 对很多 2.4G 游戏鼠标并没有统一、可靠的电量读取 API。不同品牌可能把电量放在私有 HID 报告、Vendor Defined Usage Page、网页驱动、桌面驱动或私有协议里。
+- **Ninjutso SORA V2 部分型号**：使用从官方 NinjaForce 网页驱动里确认的 HID Feature Report 协议读取。
+- **ATK / COMPX 系 2.4G 鼠标部分型号**：使用部分 8K NANO 接收器暴露的 COMPX HID 电量命令读取。
+- 支持同时插入多个已支持鼠标，并在托盘菜单里一起显示。
+- 未知设备仍可走本地 profile / 自动候选学习流程，但这是备用方案，需要用户用官方驱动显示的电量做一次确认。
 
-这个项目公开 SORA V2 上可行的实现路径，让其他人可以研究、验证和扩展，也希望未来能逐步兼容更多无线鼠标。
+已知限制：
+
+- 很多无线鼠标使用私有 HID 报告、本地驱动桥、厂商服务或未公开协议。没有实物时，通常可以从公开网页驱动代码里提取读取方法，但无法完整验证真实设备行为。
+
+## 当前版本支持的协议
+
+### Ninjutso SORA V2 官方 HID
+
+SORA V2 现在使用 NinjaForce 网页驱动中观察到的官方风格 HID Feature Report 读取电量。
+
+已知 VID/PID 家族：
+
+```text
+VID: 0x1915
+已知 / 预期产品 ID 包括：0xAE11-0xAE16, 0xAE1C, 0xAE8A, 0xAE8C
+```
+
+电量查询：
+
+```text
+Feature report ID: 0x05
+命令字节:          0x15
+请求 payload:      15 00 00 01 00 00 04 ...
+电量字节:          response[9]
+充电字节:          response[10] == 1
+```
+
+当这个内置 provider 命中时，旧的 `draft-1915-*` 学习 profile 会被主动忽略，所以 SORA V2 不再依赖猜测 offset。
+
+### ATK / COMPX HID
+
+部分 ATK / COMPX 2.4G 接收器会通过 vendor HID 命令暴露电量。
+
+已知 VID 家族：
+
+```text
+VID: 0x373B
+示例产品：Wireless mouse 8k NANO dongle-L
+```
+
+实现说明：
+
+```text
+Report ID:      0x08
+Command:        0x04
+Payload length: 16 bytes
+电量字节:       从命令响应 payload 中解析
+充电字节:       从命令响应 payload 中解析
+```
+
+这个 provider 只在开发时手头的设备上验证过。它应被理解为 ATK/COMPX 风格设备的部分支持，不代表所有 ATK 鼠标都一定可用。
 
 ## 核心功能
 
-- 作为托盘程序运行。
+- 作为 Windows 托盘程序运行。
 - 左键点击托盘图标：立即检测一次电量。
-- 右键点击托盘图标：调整阈值、检测间隔、提醒冷却、语言、提示音、音量、开机自启、卸载。
-- 插线状态：托盘图标切换为静态充电图标。
-- 拔线 / 无线状态：托盘图标切回电池图标。
-- 电池图标按 5% 档位绘制，避免 1% 变化就频繁重绘。
+- 右键点击托盘图标：调整阈值、检测间隔、提醒冷却、语言、提示音、音量、开机自启、profile 工具、卸载。
+- 多个已支持鼠标同时连接时，可一起显示。
+- 插线 / 充电状态使用静态充电托盘图标。
+- 无线状态使用电池托盘图标，并按 5% 档位绘制，避免频繁重绘。
 - 低电量提示音可自定义 WAV。
 - 默认提示音音量为 15%，除非用户自行修改。
-- 配置和音效保存在 `文档\SoraV2BatteryTip`。
+- 配置、profile、音效、日志和电量历史保存在 `文档\SoraV2BatteryTip`。
 
-## 最关键的实现经验
+## 稳定性原则
 
-最终丝滑版本的关键是：**USB 插拔瞬间完全不查询 HID 电量**。
+最终流畅版本的关键是：**USB 插拔瞬间不要重度查询 HID**。
 
 早期版本曾经这样做：
 
@@ -45,57 +95,47 @@ USB 设备变化
 -> 解析电量
 ```
 
-这样会在拔线、无线接收器恢复、Windows HID 栈重新枚举的瞬间打扰鼠标，导致鼠标短暂假死。
+这可能会在 Windows 和接收器重新稳定的瞬间打扰鼠标输入。
 
-稳定版本改成：
-
-```text
-Windows HID 接口通知
--> 只读取通知里的设备路径字符串
--> VID_1915 PID_AE12 表示 SORA V2 有线接口
--> VID_1915 PID_AE1C 表示 SORA V2 无线接口
--> 立即更新托盘状态
--> 插拔瞬间绝不打开 HID、绝不发包
-```
-
-电量读取只发生在：
-
-- 程序启动时
-- 定时检测时
-- 用户手动立即检测时
-
-这个拆分是整个项目流畅的核心。
-
-## SORA V2 电量读取路径
-
-SORA V2 当前使用 HID Feature Report 读取电量：
-
-1. 根据 VID/PID 找到 SORA V2 HID 设备。
-2. 使用 report `0x05` 读取 profile index。
-3. 使用 report `0x04` 加 profile index 请求状态。
-4. 从返回 payload 中解析电量、充电、满电、模式、在线状态。
-5. 对切换过程中的异常瞬时值做稳定化处理，例如 `1%`。
-
-当前已知 ID：
+当前设计把两件事拆开：
 
 ```text
-VID: 0x1915
-有线 PID: 0xAE12
-无线 PID: 0xAE1C
+USB/HID 通知
+-> 低成本更新状态或安排刷新
+-> 插拔过渡期避免重度 HID 探测
+
+程序启动 / 定时检测 / 用户手动检测
+-> 通过 provider 读取电量
+-> 更新托盘状态和历史记录
 ```
 
-## 未来计划
+这是这个项目最重要的实现经验。
 
-长期目标是尽可能兼容更多无线鼠标。欢迎熟悉 HID、USB、WebHID、Vendor Defined Report、游戏鼠标固件协议的人参与。
+## 架构
 
-可能方向：
+电量读取采用 provider 架构：
 
-- Provider 架构，支持不同设备族。
-- 已知鼠标配置文件。
-- 安全 HID 诊断模式。
-- 学习模式：让用户输入官方驱动 / 网页驱动显示的电量，对比原始 HID 报告候选字节。
-- 社区提交 JSON profile。
-- 更通用地识别电量、充电、满电、在线、有线 / 无线状态。
+```text
+NinjutsoSoraOfficialProvider
+-> CompxBatteryProvider
+-> KnownDeviceProfileProvider / 本地学习 JSON profile
+```
+
+程序优先使用已验证的内置官方协议。本地学习 profile 适合暂时不值得写成内置 provider 的未知设备，但优先级更低，未来可以被内置 provider 替代。
+
+## 数据目录
+
+```text
+%USERPROFILE%\Documents\SoraV2BatteryTip
+```
+
+包含：
+
+- `settings.json`
+- `status.json`
+- `sounds\*.wav`
+- `profiles\*.json`
+- 电量历史和诊断导出
 
 ## 编译
 
@@ -111,17 +151,17 @@ dotnet publish .\src\SoraV2BatteryTip\SoraV2BatteryTip.csproj -c Release -r win-
 .\releases\latest\SoraV2BatteryTip.exe
 ```
 
-## 数据目录
+## 未来计划
 
-```text
-%USERPROFILE%\Documents\SoraV2BatteryTip
-```
+长期目标是尽可能兼容更多无线鼠标。欢迎熟悉 HID、USB、WebHID、Vendor Defined Report、游戏鼠标固件协议的人参与。
 
-包含：
+有价值的贡献方向：
 
-- `settings.json`
-- `status.json`
-- `sounds\*.wav`
+- 更多鼠标品牌的已验证协议。
+- 安全诊断包：VID/PID、report 长度、匿名原始响应。
+- 暂时不需要内置 provider 的设备 JSON profile。
+- 更准确的充电、满电、在线状态识别。
+- 厂商网页驱动 HID 逻辑分析。
 
 ## 许可证
 

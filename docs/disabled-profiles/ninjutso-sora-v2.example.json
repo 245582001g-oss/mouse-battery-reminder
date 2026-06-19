@@ -1,0 +1,20 @@
+﻿{
+  "name": "Ninjutso SORA V2",
+  "priority": 900,
+  "vendorId": "0x1915",
+  "productIds": ["0xAE1C", "0xAE12"],
+  "cableProductIds": ["0xAE12"],
+  "productNameContains": ["Sora", "Ninjutso"],
+  "reportType": "Feature",
+  "reportId": "0x04",
+  "responseReportId": "0x04",
+  "requestBytes": ["0x04", "0x26", "0x00", "0x01", "0x00", "0x01"],
+  "minFeatureLength": 73,
+  "delayMs": 120,
+  "payloadStarts": [9, 10],
+  "batteryOffset": 7,
+  "chargingOffset": 8,
+  "fullOffset": 9,
+  "onlineOffset": 11,
+  "notes": "SORA V2 status report. The profile byte may differ by device profile; dedicated SoraV2BatteryProvider remains the preferred stable path because it first queries the active profile."
+}

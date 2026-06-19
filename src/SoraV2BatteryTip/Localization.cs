@@ -4,7 +4,10 @@ internal sealed class Localizer
 {
     private readonly Func<AppSettings> _settings;
     public Localizer(Func<AppSettings> settings) => _settings = settings;
-    public bool IsZh => _settings().Language.Equals("zh-CN", StringComparison.OrdinalIgnoreCase) || (_settings().Language == "auto" && Thread.CurrentThread.CurrentUICulture.Name.StartsWith("zh"));
+
+    public bool IsZh => _settings().Language.Equals("zh-CN", StringComparison.OrdinalIgnoreCase)
+        || (_settings().Language.Equals("auto", StringComparison.OrdinalIgnoreCase) && Thread.CurrentThread.CurrentUICulture.Name.StartsWith("zh", StringComparison.OrdinalIgnoreCase));
+
     public string this[string key] => IsZh ? Zh(key) : En(key);
 
     private static string Zh(string key) => key switch
@@ -15,6 +18,33 @@ internal sealed class Localizer
         "CheckNow" => "立即检测",
         "BatteryHistory" => "电量记录",
         "TestSound" => "测试提示音",
+        "DeviceProfiles" => "设备配置",
+        "LoadedProfiles" => "已加载配置",
+        "InvalidProfiles" => "无效配置",
+        "ReloadProfiles" => "重新加载设备配置",
+        "ProfilesReloaded" => "设备配置已重新加载",
+        "CollectCandidates" => "收集电量候选",
+        "AutoSetupUnknownMouse" => "自动识别未知鼠标",
+        "AutoSetupRunning" => "正在自动识别鼠标电量...",
+        "AutoSetupSuccess" => "未知鼠标已自动识别",
+        "AutoSetupFailed" => "未能自动识别鼠标电量",
+        "AutoSetupImportedButReadFailed" => "Profile 已导入，但本次读取失败",
+        "ImportLatestDrafts" => "导入最近 Profile 草稿",
+        "DraftsImported" => "Profile 草稿已导入",
+        "DraftsRejected" => "未找到可验证通过的草稿",
+        "NoDraftsFound" => "未找到可导入的 Profile 草稿",
+        "ImportVerifiedHint" => "只导入验证通过的草稿",
+        "OfficialBatteryPrompt" => "请输入官方驱动显示的电量百分比：",
+        "CandidatesDone" => "候选结果已导出",
+        "OpenProfilesFolder" => "打开设备配置文件夹",
+        "ExportDiagnostics" => "导出诊断包",
+        "DiagnosticsDone" => "诊断包已导出",
+        "LastCheck" => "上次检测",
+        "Source" => "来源",
+        "FailureReason" => "失败原因",
+        "Failure_not_detected" => "未检测到设备",
+        "Failure_read_failed" => "检测到设备但读取失败",
+        "Never" => "从未",
         "Exit" => "退出",
         "Uninstall" => "卸载并清理",
         "UninstallTitle" => "卸载 Sora V2 Battery 提示",
@@ -32,13 +62,12 @@ internal sealed class Localizer
         "Last24Hours" => "24小时",
         "Last7Days" => "7天",
         "Last30Days" => "30天",
-        "HistoryDemo" => "演示样板数据",
+        "HistoryDemo" => "暂无真实记录",
         "HistoryRealData" => "真实记录数据",
         "HistoryEstimate" => "预计剩余",
         "HistoryUnavailable" => "暂无",
         "HistoryConsumed" => "范围内消耗",
         "HistoryAverage" => "平均耗电",
-        "HistoryChargingTimes" => "充电段",
         "HistoryLastFull" => "最近满电/充电",
         _ => key
     };
@@ -51,6 +80,33 @@ internal sealed class Localizer
         "CheckNow" => "Check Now",
         "BatteryHistory" => "Battery History",
         "TestSound" => "Test Sound",
+        "DeviceProfiles" => "Device Profiles",
+        "LoadedProfiles" => "Loaded profiles",
+        "InvalidProfiles" => "Invalid profiles",
+        "ReloadProfiles" => "Reload Device Profiles",
+        "ProfilesReloaded" => "Device profiles reloaded",
+        "CollectCandidates" => "Collect Battery Candidates",
+        "AutoSetupUnknownMouse" => "Auto-detect Unknown Mouse",
+        "AutoSetupRunning" => "Auto-detecting mouse battery...",
+        "AutoSetupSuccess" => "Unknown mouse auto-detected",
+        "AutoSetupFailed" => "Could not auto-detect mouse battery",
+        "AutoSetupImportedButReadFailed" => "Profile imported, but this read failed",
+        "ImportLatestDrafts" => "Import Latest Profile Drafts",
+        "DraftsImported" => "Profile drafts imported",
+        "DraftsRejected" => "No draft passed verification",
+        "NoDraftsFound" => "No profile drafts found",
+        "ImportVerifiedHint" => "Only verified drafts are imported",
+        "OfficialBatteryPrompt" => "Enter the battery percentage shown by the official driver:",
+        "CandidatesDone" => "Candidate results exported",
+        "OpenProfilesFolder" => "Open Device Profiles Folder",
+        "ExportDiagnostics" => "Export Diagnostics",
+        "DiagnosticsDone" => "Diagnostics exported",
+        "LastCheck" => "Last check",
+        "Source" => "Source",
+        "FailureReason" => "Failure",
+        "Failure_not_detected" => "device not detected",
+        "Failure_read_failed" => "device found but read failed",
+        "Never" => "never",
         "Exit" => "Exit",
         "Uninstall" => "Uninstall and clean up",
         "UninstallTitle" => "Uninstall Sora V2 Battery Tip",
@@ -68,15 +124,13 @@ internal sealed class Localizer
         "Last24Hours" => "24h",
         "Last7Days" => "7d",
         "Last30Days" => "30d",
-        "HistoryDemo" => "Demo sample data",
+        "HistoryDemo" => "No real records yet",
         "HistoryRealData" => "Real recorded data",
         "HistoryEstimate" => "Estimated remaining",
         "HistoryUnavailable" => "n/a",
         "HistoryConsumed" => "Used in range",
         "HistoryAverage" => "Average drain",
-        "HistoryChargingTimes" => "Charging segments",
         "HistoryLastFull" => "Last full/charge",
         _ => key
     };
 }
-

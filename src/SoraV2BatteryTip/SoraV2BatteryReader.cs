@@ -1,32 +1,151 @@
-﻿using HidSharp;
-namespace SoraV2BatteryTip;
-internal sealed class SoraV2BatteryReader
+﻿namespace SoraV2BatteryTip;
+
+internal interface IBatteryProvider
 {
-    private const int VendorId=0x1915, WiredProductId=0xAE12, WirelessProductId=0xAE1C, FeatureReportId=0x05, MainReportId=0x04;
-    private const int MinimumValidBatteryPercentage=3, SuspiciousDropThreshold=30, LowBatteryConfirmationCount=3;
-    private int? _lastGoodBatteryPercentage;
-    private int? _pendingLowBatteryPercentage;
-    private int _pendingLowBatteryCount;
-    public Task<BatteryReading?> ReadAsync(CancellationToken token)=>Task.Run(()=>ReadOnce(token),token);
-    public (bool WiredPresent,bool WirelessPresent) DetectConnection()
-    {
-        var wired=DeviceList.Local.GetHidDevices(VendorId,WiredProductId).Any(IsSoraDevice);
-        var wireless=DeviceList.Local.GetHidDevices(VendorId,WirelessProductId).Any(IsSoraDevice);
-        return (wired,wireless);
-    }
-    private BatteryReading? ReadOnce(CancellationToken token)
-    {
-        var devices=new[]{WiredProductId,WirelessProductId}.SelectMany(pid=>DeviceList.Local.GetHidDevices(VendorId,pid).Where(d=>d.GetMaxFeatureReportLength()>1).OrderByDescending(d=>d.GetMaxFeatureReportLength()).Select(d=>new{Device=d,IsCableConnected=pid==WiredProductId})).ToList();
-        foreach(var item in devices){ var device=item.Device; token.ThrowIfCancellationRequested(); if(!IsSoraDevice(device))continue; if(!device.TryOpen(out var stream)||stream==null)continue; using(stream){ try{ var profile=ReadProfile(stream,device); if(profile<=0)continue; var first=ReadStatus(stream,device,profile,item.IsCableConnected); if(first==null)continue; Thread.Sleep(120); var second=ReadStatus(stream,device,profile,item.IsCableConnected); if(second==null)continue; if(Math.Abs(first.BatteryPercentage-second.BatteryPercentage)>1)continue; return Stabilize(second);}catch{} } }
-        return null;
-    }
-    private static bool IsSoraDevice(HidDevice device){ var p=string.Empty; try{p=device.GetProductName()??string.Empty;}catch{} return p.Length==0||p.Contains("Sora",StringComparison.OrdinalIgnoreCase)||p.Contains("Ninjutso",StringComparison.OrdinalIgnoreCase); }
-    private static int ReadProfile(HidStream stream,HidDevice device){ var len=Math.Max(32,device.GetMaxFeatureReportLength()); var req=new byte[len]; req[0]=FeatureReportId; req[1]=13; req[3]=1; req[6]=22; for(var i=0;i<2;i++){ stream.SetFeature(req,0,req.Length); Thread.Sleep(25); var resp=new byte[len]; resp[0]=FeatureReportId; stream.GetFeature(resp,0,resp.Length); if(resp.Length>9&&resp[9]!=0)return resp[9]; if(resp.Length>10&&resp[10]!=0)return resp[10]; } return 0; }
-    private static BatteryReading? ReadStatus(HidStream stream,HidDevice device,int profile,bool isCableConnected){ var len=Math.Max(73,device.GetMaxFeatureReportLength()); var req=new byte[len]; req[0]=MainReportId; req[1]=38; req[3]=1; req[5]=checked((byte)profile); stream.SetFeature(req,0,req.Length); Thread.Sleep(120); var resp=new byte[len]; resp[0]=MainReportId; stream.GetFeature(resp,0,resp.Length); return TryParseStatus(resp,isCableConnected,out var reading)?reading:null; }
-    private static bool TryParseStatus(byte[] response,bool isCableConnected,out BatteryReading reading){ reading=null!; foreach(var payloadStart in new[]{9,10}){ if(response.Length<=payloadStart+11)continue; if(payloadStart==10&&response[0]!=MainReportId)continue; var battery=response[payloadStart+7]; var charging=response[payloadStart+8]; var full=response[payloadStart+9]; var mode=response[payloadStart+10]; var online=response[payloadStart+11]; if(battery is <1 or >100||charging>1||full>1||mode>1||online>1)continue; reading=new BatteryReading{BatteryPercentage=battery,HasBatteryPercentage=true,IsCharging=charging==1||full==1,IsFullyCharged=full==1,IsOnline=online==1,IsCableConnected=isCableConnected,Source="SORA V2 HID"}; return true;} return false; }
-    private BatteryReading? Stabilize(BatteryReading reading){ if(reading.BatteryPercentage is >0 and <MinimumValidBatteryPercentage){ if(ConfirmRepeatedLowBattery(reading.BatteryPercentage)){ _lastGoodBatteryPercentage=reading.BatteryPercentage; return reading; } return _lastGoodBatteryPercentage.HasValue?WithBattery(reading,_lastGoodBatteryPercentage.Value):null; } if(_lastGoodBatteryPercentage.HasValue&&_lastGoodBatteryPercentage.Value-reading.BatteryPercentage>=SuspiciousDropThreshold){ if(reading.BatteryPercentage<=10&&ConfirmRepeatedLowBattery(reading.BatteryPercentage)){ _lastGoodBatteryPercentage=reading.BatteryPercentage; return reading; } return WithBattery(reading,_lastGoodBatteryPercentage.Value); } ResetPendingLowBattery(); _lastGoodBatteryPercentage=reading.BatteryPercentage; return reading; }
-    private bool ConfirmRepeatedLowBattery(int batteryPercentage){ if(_pendingLowBatteryPercentage==batteryPercentage)_pendingLowBatteryCount++; else{ _pendingLowBatteryPercentage=batteryPercentage; _pendingLowBatteryCount=1; } return _pendingLowBatteryCount>=LowBatteryConfirmationCount; }
-    private void ResetPendingLowBattery(){ _pendingLowBatteryPercentage=null; _pendingLowBatteryCount=0; }
-    private static BatteryReading WithBattery(BatteryReading reading,int batteryPercentage)=>new(){BatteryPercentage=batteryPercentage,HasBatteryPercentage=true,IsCharging=reading.IsCharging,IsFullyCharged=reading.IsFullyCharged,IsOnline=reading.IsOnline,IsCableConnected=reading.IsCableConnected,Source=reading.Source};
+    string Name { get; }
+    int Priority { get; }
+    bool IsAvailable();
+    Task<BatteryReading?> ReadAsync(CancellationToken token);
 }
 
+internal interface IMultipleBatteryProvider
+{
+    Task<IReadOnlyList<BatteryReading>> ReadAllAsync(CancellationToken token);
+}
+
+internal sealed class BatteryProviderManager
+{
+    private readonly IReadOnlyList<IBatteryProvider> _providers;
+
+    public BatteryProviderManager(IEnumerable<IBatteryProvider> providers)
+    {
+        _providers = providers.OrderByDescending(provider => provider.Priority).ToArray();
+    }
+
+    public IReadOnlyList<ProviderStatus> GetProviderStatus()
+    {
+        var result = new List<ProviderStatus>();
+        foreach (var provider in _providers)
+        {
+            try
+            {
+                result.Add(new ProviderStatus
+                {
+                    Name = provider.Name,
+                    Priority = provider.Priority,
+                    IsAvailable = provider.IsAvailable()
+                });
+            }
+            catch (Exception ex)
+            {
+                result.Add(new ProviderStatus
+                {
+                    Name = provider.Name,
+                    Priority = provider.Priority,
+                    IsAvailable = false,
+                    Error = ex.GetType().Name
+                });
+            }
+        }
+
+        return result;
+    }
+
+    public async Task<BatteryReadResult> ReadAsync(CancellationToken token)
+    {
+        var result = await ReadAllAsync(token).ConfigureAwait(false);
+        return new BatteryReadResult
+        {
+            Reading = result.Readings.FirstOrDefault(),
+            Source = result.Source,
+            FailureReason = result.FailureReason
+        };
+    }
+
+    public async Task<BatteryReadAllResult> ReadAllAsync(CancellationToken token)
+    {
+        var availableProviderFound = false;
+        var failedProviderNames = new List<string>();
+        var readings = new List<BatteryReading>();
+
+        foreach (var provider in _providers)
+        {
+            token.ThrowIfCancellationRequested();
+            if (!provider.IsAvailable())
+                continue;
+
+            availableProviderFound = true;
+            try
+            {
+                var providerReadings = await ReadProviderAllAsync(provider, token).ConfigureAwait(false);
+                if (providerReadings.Count == 0)
+                {
+                    await Task.Delay(250, token).ConfigureAwait(false);
+                    providerReadings = await ReadProviderAllAsync(provider, token).ConfigureAwait(false);
+                }
+
+                foreach (var reading in providerReadings)
+                {
+                    if (!IsDuplicateReading(readings, reading))
+                        readings.Add(reading);
+                }
+
+                if (providerReadings.Count == 0)
+                    failedProviderNames.Add(provider.Name);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                failedProviderNames.Add(provider.Name);
+            }
+        }
+
+        if (readings.Count > 0)
+        {
+            return new BatteryReadAllResult
+            {
+                Readings = readings,
+                Source = string.Join(", ", readings.Select(reading => reading.Source).Distinct(StringComparer.OrdinalIgnoreCase)),
+                FailureReason = ""
+            };
+        }
+
+        return new BatteryReadAllResult
+        {
+            Source = failedProviderNames.Count > 0 ? string.Join(", ", failedProviderNames) : "none",
+            FailureReason = availableProviderFound ? "read_failed" : "not_detected"
+        };
+    }
+
+    private static async Task<IReadOnlyList<BatteryReading>> ReadProviderAllAsync(IBatteryProvider provider, CancellationToken token)
+    {
+        if (provider is IMultipleBatteryProvider multipleProvider)
+            return await multipleProvider.ReadAllAsync(token).ConfigureAwait(false);
+
+        var reading = await provider.ReadAsync(token).ConfigureAwait(false);
+        return reading == null ? Array.Empty<BatteryReading>() : new[] { reading };
+    }
+
+    private static bool IsDuplicateReading(List<BatteryReading> existingReadings, BatteryReading candidate)
+    {
+        foreach (var existing in existingReadings)
+        {
+            if (!string.IsNullOrWhiteSpace(candidate.DeviceId)
+                && !string.IsNullOrWhiteSpace(existing.DeviceId)
+                && string.Equals(candidate.DeviceId, existing.DeviceId, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (!string.Equals(candidate.Source, existing.Source, StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrWhiteSpace(candidate.VendorId)
+                && !string.IsNullOrWhiteSpace(candidate.ProductId)
+                && string.Equals(candidate.VendorId, existing.VendorId, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(candidate.ProductId, existing.ProductId, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+}
