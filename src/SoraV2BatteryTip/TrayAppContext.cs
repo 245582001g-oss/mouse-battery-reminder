@@ -1,4 +1,4 @@
-﻿using System.Drawing.Drawing2D;
+using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 
 namespace SoraV2BatteryTip;
@@ -28,7 +28,7 @@ internal sealed class TrayAppContext : ApplicationContext
     private BatteryHistoryWindow? _historyWindow;
     private Icon? _dynamicIcon;
     private ToolStripMenuItem? _statusItem;
-    private string _statusText = "SORA V2: not detected";
+    private string _statusText = "Mouse Battery Reminder: not detected";
     private string? _lastTrayText;
     private string? _lastIconKey;
     private int? _lastBatteryPercentage;
@@ -67,7 +67,7 @@ internal sealed class TrayAppContext : ApplicationContext
         _notifyIcon = new NotifyIcon
         {
             Icon = LoadAppIcon(),
-            Text = "Sora V2 Battery Tip",
+            Text = _text["AppName"],
             Visible = true,
             ContextMenuStrip = _menu
         };
@@ -490,7 +490,7 @@ internal sealed class TrayAppContext : ApplicationContext
 
         if (_lastFailureReason == "read_failed" && _lastBatteryPercentage.HasValue)
         {
-            var text = $"SORA V2: {_lastBatteryPercentage.Value}% ({LocalizeFailure(_lastFailureReason)})";
+            var text = $"{_text["AppName"]}: {_lastBatteryPercentage.Value}% ({LocalizeFailure(_lastFailureReason)})";
             SetStatusText(text);
             SetTrayText(TrimTrayText(text));
             UpdateIcon(cableConnected: _isCableConnected, batteryBucket: _lastBatteryBucket ?? 100);
@@ -509,7 +509,7 @@ internal sealed class TrayAppContext : ApplicationContext
         if (_isCableConnected)
         {
             var battery = _lastBatteryPercentage.HasValue ? $"{_lastBatteryPercentage.Value}% " : string.Empty;
-            var text = $"SORA V2: {battery}{_text["Charging"]}";
+            var text = $"{_text["AppName"]}: {battery}{_text["Charging"]}";
             SetStatusText(text);
             SetTrayText(TrimTrayText(text));
             UpdateIcon(cableConnected: true, batteryBucket: _lastBatteryBucket ?? 100);
@@ -518,7 +518,7 @@ internal sealed class TrayAppContext : ApplicationContext
 
         if (_lastBatteryBucket.HasValue)
         {
-            var text = _lastBatteryPercentage.HasValue ? $"SORA V2: {_lastBatteryPercentage.Value}%" : "SORA V2";
+            var text = _lastBatteryPercentage.HasValue ? $"{_text["AppName"]}: {_lastBatteryPercentage.Value}%" : _text["AppName"];
             SetStatusText(text);
             SetTrayText(TrimTrayText(text));
             UpdateIcon(cableConnected: false, batteryBucket: _lastBatteryBucket.Value);
@@ -531,7 +531,7 @@ internal sealed class TrayAppContext : ApplicationContext
     private void RenderNotDetected()
     {
         SetStatusText(_text["NotReady"]);
-        SetTrayText("SORA V2: not detected");
+        SetTrayText(_text["NotReady"]);
         SetDefaultIcon();
     }
 

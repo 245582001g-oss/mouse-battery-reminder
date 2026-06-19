@@ -1,4 +1,4 @@
-﻿namespace SoraV2BatteryTip;
+namespace SoraV2BatteryTip;
 
 internal sealed class Localizer
 {
@@ -12,8 +12,9 @@ internal sealed class Localizer
 
     private static string Zh(string key) => key switch
     {
-        "NotReady" => "SORA V2: 未检测到",
-        "Checking" => "SORA V2: 正在检测...",
+        "AppName" => "鼠标电量提醒",
+        "NotReady" => "鼠标电量提醒：未检测到",
+        "Checking" => "鼠标电量提醒：正在检测...",
         "Charging" => "充电中",
         "CheckNow" => "立即检测",
         "BatteryHistory" => "电量记录",
@@ -47,9 +48,9 @@ internal sealed class Localizer
         "Never" => "从未",
         "Exit" => "退出",
         "Uninstall" => "卸载并清理",
-        "UninstallTitle" => "卸载 Sora V2 Battery 提示",
-        "UninstallConfirm" => "确认彻底卸载？\n\n将清理开机启动项、注册表中的本软件记录、我的文档中的 SoraV2BatteryTip 数据目录，并在程序退出后删除当前程序目录。\n\n此操作不可撤销。",
-        "UninstallStartedTitle" => "Sora V2 Battery 提示",
+        "UninstallTitle" => "卸载 鼠标电量提醒",
+        "UninstallConfirm" => "确认彻底卸载？\n\n将清理开机启动项、注册表中的本软件记录、我的文档中的鼠标电量提醒数据目录（SoraV2BatteryTip），并在程序退出后删除当前程序目录。\n\n此操作不可撤销。",
+        "UninstallStartedTitle" => "鼠标电量提醒",
         "UninstallStarted" => "已开始卸载。程序退出后会继续清理当前程序目录。",
         "Threshold" => "低电量阈值 (%)",
         "Interval" => "检测间隔 (分钟)",
@@ -74,8 +75,9 @@ internal sealed class Localizer
 
     private static string En(string key) => key switch
     {
-        "NotReady" => "SORA V2: not detected",
-        "Checking" => "SORA V2: checking...",
+        "AppName" => "Mouse Battery Reminder",
+        "NotReady" => "Mouse Battery Reminder: not detected",
+        "Checking" => "Mouse Battery Reminder: checking...",
         "Charging" => "charging",
         "CheckNow" => "Check Now",
         "BatteryHistory" => "Battery History",
@@ -109,9 +111,9 @@ internal sealed class Localizer
         "Never" => "never",
         "Exit" => "Exit",
         "Uninstall" => "Uninstall and clean up",
-        "UninstallTitle" => "Uninstall Sora V2 Battery Tip",
-        "UninstallConfirm" => "Completely uninstall?\n\nThis will remove startup entries, this app's registry records, the SoraV2BatteryTip data directory in Documents, and delete the current program directory after the app exits.\n\nThis cannot be undone.",
-        "UninstallStartedTitle" => "Sora V2 Battery Tip",
+        "UninstallTitle" => "Uninstall Mouse Battery Reminder",
+        "UninstallConfirm" => "Completely uninstall?\n\nThis will remove startup entries, this app's registry records, the Mouse Battery Reminder data directory in Documents (SoraV2BatteryTip), and delete the current program directory after the app exits.\n\nThis cannot be undone.",
+        "UninstallStartedTitle" => "Mouse Battery Reminder",
         "UninstallStarted" => "Uninstall started. The current program directory will be removed after the app exits.",
         "Threshold" => "Low battery threshold (%)",
         "Interval" => "Polling interval (minutes)",

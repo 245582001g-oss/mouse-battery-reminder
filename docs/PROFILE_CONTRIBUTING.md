@@ -1,6 +1,6 @@
-﻿# Profile contribution guide
+# Profile contribution guide
 
-Sora V2 Battery Tip supports local JSON profiles in:
+Mouse Battery Reminder supports local JSON profiles in:
 
 `Documents\SoraV2BatteryTip\profiles`
 

@@ -1,4 +1,4 @@
-﻿---
+---
 name: New mouse support
 about: Request support for another wireless mouse
 labels: new-device, profile

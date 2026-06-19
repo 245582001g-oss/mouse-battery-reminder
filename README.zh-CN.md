@@ -1,4 +1,4 @@
-﻿# Sora V2 Battery 提示
+# 鼠标电量提醒
 
 [English](README.md) | 简体中文
 
@@ -79,7 +79,7 @@ Payload length: 16 bytes
 - 无线状态使用电池托盘图标，并按 5% 档位绘制，避免频繁重绘。
 - 低电量提示音可自定义 WAV。
 - 默认提示音音量为 15%，除非用户自行修改。
-- 配置、profile、音效、日志和电量历史保存在 `文档\SoraV2BatteryTip`。
+- 配置、profile、音效、日志和电量历史保存在 `文档\SoraV2BatteryTip`（为兼容旧版本保留目录名）。
 
 ## 稳定性原则
 

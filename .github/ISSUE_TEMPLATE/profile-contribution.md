@@ -1,4 +1,4 @@
-﻿---
+---
 name: Profile contribution
 about: Submit a working mouse battery profile
 labels: profile-contribution

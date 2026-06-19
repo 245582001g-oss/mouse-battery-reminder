@@ -1,8 +1,8 @@
-﻿# Sora V2 Battery Tip
+# 鼠标电量提醒 (Mouse Battery Reminder)
 
 English | [简体中文](README.zh-CN.md)
 
-A lightweight Windows tray utility for wireless gaming mouse battery status and low-battery alerts.
+鼠标电量提醒 (Mouse Battery Reminder) is a lightweight Windows tray utility for wireless gaming mouse battery status and low-battery alerts.
 
 The original goal is simple: while gaming, do not discover that the mouse is out of power only after it suddenly stops working.
 
@@ -79,7 +79,7 @@ This provider is verified only on the devices available during development. It s
 - Wireless state uses a battery tray icon bucketed by 5 percent to avoid unnecessary icon churn.
 - Low-battery alerts use user-selectable WAV sounds.
 - Alert volume defaults to 15 percent unless the user changes it.
-- Settings, profiles, sounds, logs, and history live in `Documents\SoraV2BatteryTip`.
+- Settings, profiles, sounds, logs, and history live in `Documents\SoraV2BatteryTip` (kept as a stable compatibility directory).
 
 ## Stability principle
 

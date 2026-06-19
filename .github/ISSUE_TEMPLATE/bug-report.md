@@ -1,6 +1,6 @@
-﻿---
+---
 name: Bug report
-about: Report a problem with Sora V2 Battery Tip
+about: Report a problem with Mouse Battery Reminder
 labels: bug
 ---
 

@@ -146,7 +146,7 @@ internal sealed class BatteryHistoryWindow : Form
     {
         _store = store;
         _text = text;
-        Text = "Sora V2 Battery History";
+        Text = $"{_text["AppName"]} - {_text["BatteryHistory"]}";
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(720, 760);
         Size = new Size(890, 1140);
@@ -215,7 +215,7 @@ internal sealed class BatteryHistoryWindow : Form
         var charging = latest?.IsCharging == true || latest?.IsCableConnected == true;
         var lastCharge = entries.LastOrDefault(e => e.IsCharging || e.IsCableConnected)?.TimestampUtc.ToLocalTime();
 
-        _title.Text = latest == null ? "SORA V2" : $"SORA V2 · {latest.BatteryPercentage}%";
+        _title.Text = latest == null ? _text["AppName"] : $"{_text["AppName"]} · {latest.BatteryPercentage}%";
         _summary.Text = $"{(entries.Count == 0 ? _text["HistoryDemo"] : _text["HistoryRealData"])}\r\n{(charging ? _text["Charging"] : "")}";
         _summary.ForeColor = charging ? Color.FromArgb(88, 224, 112) : Color.Gainsboro;
         _estimate.Text = $"{_text["HistoryEstimate"]}\r\n{estimateText}";

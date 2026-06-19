@@ -1,11 +1,11 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <RootNamespace>SoraV2BatteryTip</RootNamespace>
     <AssemblyName>SoraV2BatteryTip</AssemblyName>
-    <AssemblyTitle>Sora V2 Battery Tip</AssemblyTitle>
-    <Product>Sora V2 Battery Tip</Product>
+    <AssemblyTitle>鼠标电量提醒</AssemblyTitle>
+    <Product>鼠标电量提醒</Product>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWindowsForms>true</UseWindowsForms>
