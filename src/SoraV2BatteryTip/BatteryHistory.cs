@@ -1,4 +1,4 @@
-using System.Drawing.Drawing2D;
+﻿using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 
@@ -7,11 +7,26 @@ namespace SoraV2BatteryTip;
 internal sealed class BatteryHistoryEntry
 {
     public DateTime TimestampUtc { get; set; }
+    public string DeviceKey { get; set; } = "";
+    public string DeviceName { get; set; } = "";
+    public string VendorId { get; set; } = "";
+    public string ProductId { get; set; } = "";
     public int BatteryPercentage { get; set; }
     public bool IsCharging { get; set; }
     public bool IsCableConnected { get; set; }
     public string State { get; set; } = "";
     public string Source { get; set; } = "";
+}
+
+internal sealed class BatteryHistoryDevice
+{
+    public string DeviceKey { get; init; } = "";
+    public string DeviceName { get; init; } = "";
+    public string VendorId { get; init; } = "";
+    public string ProductId { get; init; } = "";
+    public DateTime LastSeenUtc { get; init; }
+    public int LastBatteryPercentage { get; init; }
+    public bool IsCharging { get; init; }
 }
 
 internal sealed class BatteryHistoryStore
@@ -26,9 +41,17 @@ internal sealed class BatteryHistoryStore
         if (!reading.HasBatteryPercentage || reading.BatteryPercentage is < 1 or > 100)
             return;
 
+        var deviceKey = CreateDeviceKey(reading);
+        if (string.IsNullOrWhiteSpace(deviceKey))
+            return;
+
         AppendRaw(new BatteryHistoryEntry
         {
             TimestampUtc = DateTime.UtcNow,
+            DeviceKey = deviceKey,
+            DeviceName = DisplayDeviceName(reading),
+            VendorId = NormalizeId(reading.VendorId),
+            ProductId = NormalizeId(reading.ProductId),
             BatteryPercentage = reading.BatteryPercentage,
             IsCharging = reading.IsCharging || reading.IsFullyCharged || reading.IsCableConnected,
             IsCableConnected = reading.IsCableConnected,
@@ -37,10 +60,83 @@ internal sealed class BatteryHistoryStore
         });
     }
 
-    public IReadOnlyList<BatteryHistoryEntry> ReadLast(TimeSpan range)
+    public IReadOnlyList<BatteryHistoryEntry> ReadLast(TimeSpan range, string? deviceKey)
+    {
+        if (string.IsNullOrWhiteSpace(deviceKey))
+            return Array.Empty<BatteryHistoryEntry>();
+
+        PruneOldEntries();
+        var fromUtc = DateTime.UtcNow - range;
+        return ReadEntries(fromUtc)
+            .Where(entry => string.Equals(entry.DeviceKey, deviceKey, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(entry => entry.TimestampUtc)
+            .ToArray();
+    }
+
+    public IReadOnlyList<BatteryHistoryDevice> ReadDevices(TimeSpan range)
     {
         PruneOldEntries();
         var fromUtc = DateTime.UtcNow - range;
+        var latestByDevice = new Dictionary<string, BatteryHistoryEntry>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var entry in ReadEntries(fromUtc))
+        {
+            if (!latestByDevice.TryGetValue(entry.DeviceKey, out var previous) || entry.TimestampUtc > previous.TimestampUtc)
+                latestByDevice[entry.DeviceKey] = entry;
+        }
+
+        return latestByDevice.Values
+            .OrderByDescending(entry => entry.TimestampUtc)
+            .Select(entry => new BatteryHistoryDevice
+            {
+                DeviceKey = entry.DeviceKey,
+                DeviceName = entry.DeviceName,
+                VendorId = entry.VendorId,
+                ProductId = entry.ProductId,
+                LastSeenUtc = entry.TimestampUtc,
+                LastBatteryPercentage = entry.BatteryPercentage,
+                IsCharging = entry.IsCharging || entry.IsCableConnected
+            })
+            .ToArray();
+    }
+
+    private void AppendRaw(BatteryHistoryEntry entry)
+    {
+        try
+        {
+            _paths.Ensure();
+            PruneOldEntries();
+            var last = ReadLastEntry(entry.DeviceKey);
+            if (last != null && IsDuplicate(last, entry))
+                return;
+            File.AppendAllText(_paths.HistoryPath, JsonSerializer.Serialize(entry, JsonOptions) + Environment.NewLine);
+        }
+        catch { }
+    }
+
+    private BatteryHistoryEntry? ReadLastEntry(string deviceKey)
+    {
+        try
+        {
+            if (!File.Exists(_paths.HistoryPath))
+                return null;
+
+            BatteryHistoryEntry? last = null;
+            foreach (var entry in ReadEntries(DateTime.MinValue))
+            {
+                if (string.Equals(entry.DeviceKey, deviceKey, StringComparison.OrdinalIgnoreCase))
+                    last = entry;
+            }
+            return last;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private IReadOnlyList<BatteryHistoryEntry> ReadEntries(DateTime fromUtc)
+    {
         var entries = new List<BatteryHistoryEntry>();
         try
         {
@@ -51,45 +147,27 @@ internal sealed class BatteryHistoryStore
             {
                 if (string.IsNullOrWhiteSpace(line))
                     continue;
-                var entry = JsonSerializer.Deserialize<BatteryHistoryEntry>(line);
-                if (entry == null || entry.TimestampUtc < fromUtc || entry.BatteryPercentage is < 1 or > 100)
+
+                BatteryHistoryEntry? entry;
+                try { entry = JsonSerializer.Deserialize<BatteryHistoryEntry>(line); }
+                catch { continue; }
+
+                if (entry == null || entry.TimestampUtc < fromUtc || !IsValidEntry(entry))
                     continue;
+
                 entries.Add(entry);
             }
         }
         catch { }
 
-        entries.Sort((a, b) => a.TimestampUtc.CompareTo(b.TimestampUtc));
         return entries;
     }
 
-    private void AppendRaw(BatteryHistoryEntry entry)
+    private static bool IsValidEntry(BatteryHistoryEntry entry)
     {
-        try
-        {
-            _paths.Ensure();
-            PruneOldEntries();
-            var last = ReadLastEntry();
-            if (last != null && IsDuplicate(last, entry))
-                return;
-            File.AppendAllText(_paths.HistoryPath, JsonSerializer.Serialize(entry, JsonOptions) + Environment.NewLine);
-        }
-        catch { }
-    }
-
-    private BatteryHistoryEntry? ReadLastEntry()
-    {
-        try
-        {
-            if (!File.Exists(_paths.HistoryPath))
-                return null;
-            var line = File.ReadLines(_paths.HistoryPath).LastOrDefault(item => !string.IsNullOrWhiteSpace(item));
-            return string.IsNullOrWhiteSpace(line) ? null : JsonSerializer.Deserialize<BatteryHistoryEntry>(line);
-        }
-        catch
-        {
-            return null;
-        }
+        return !string.IsNullOrWhiteSpace(entry.DeviceKey)
+            && !string.IsNullOrWhiteSpace(entry.DeviceName)
+            && entry.BatteryPercentage is >= 1 and <= 100;
     }
 
     private static bool IsDuplicate(BatteryHistoryEntry previous, BatteryHistoryEntry current)
@@ -100,7 +178,8 @@ internal sealed class BatteryHistoryStore
 
         var sameValue = previous.BatteryPercentage == current.BatteryPercentage
             && previous.IsCharging == current.IsCharging
-            && previous.IsCableConnected == current.IsCableConnected;
+            && previous.IsCableConnected == current.IsCableConnected
+            && string.Equals(previous.DeviceKey, current.DeviceKey, StringComparison.OrdinalIgnoreCase);
 
         if (!sameValue)
             return false;
@@ -116,18 +195,52 @@ internal sealed class BatteryHistoryStore
                 return;
 
             var cutoff = DateTime.UtcNow.AddDays(-30);
-            var kept = new List<string>();
-            foreach (var line in File.ReadLines(_paths.HistoryPath))
-            {
-                if (string.IsNullOrWhiteSpace(line))
-                    continue;
-                var entry = JsonSerializer.Deserialize<BatteryHistoryEntry>(line);
-                if (entry != null && entry.TimestampUtc >= cutoff)
-                    kept.Add(line);
-            }
+            var kept = ReadEntries(cutoff)
+                .Select(entry => JsonSerializer.Serialize(entry, JsonOptions))
+                .ToArray();
             File.WriteAllLines(_paths.HistoryPath, kept);
         }
         catch { }
+    }
+
+    private static string CreateDeviceKey(BatteryReading reading)
+    {
+        var vendorId = NormalizeId(reading.VendorId);
+        var productId = NormalizeId(reading.ProductId);
+        var name = DisplayDeviceName(reading);
+
+        if (!string.IsNullOrWhiteSpace(vendorId) && !string.IsNullOrWhiteSpace(productId))
+            return $"{vendorId}:{productId}:{NormalizeForKey(name)}";
+
+        if (!string.IsNullOrWhiteSpace(reading.DeviceId))
+            return NormalizeForKey(reading.DeviceId);
+
+        return NormalizeForKey($"{reading.Source}:{name}");
+    }
+
+    private static string DisplayDeviceName(BatteryReading reading)
+    {
+        var name = string.IsNullOrWhiteSpace(reading.DeviceName) ? reading.Source : reading.DeviceName;
+        name = name
+            .Replace("Wireless mouse", "Mouse", StringComparison.OrdinalIgnoreCase)
+            .Replace("NANO dongle", "Dongle", StringComparison.OrdinalIgnoreCase)
+            .Trim();
+        return string.IsNullOrWhiteSpace(name) ? "Mouse" : Shorten(name, 48);
+    }
+
+    private static string NormalizeId(string value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? "" : value.Trim().ToUpperInvariant();
+    }
+
+    private static string NormalizeForKey(string value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? "" : value.Trim().ToUpperInvariant();
+    }
+
+    private static string Shorten(string value, int maxLength)
+    {
+        return value.Length <= maxLength ? value : value[..maxLength].TrimEnd();
     }
 }
 
@@ -136,11 +249,14 @@ internal sealed class BatteryHistoryWindow : Form
     private readonly BatteryHistoryStore _store;
     private readonly Localizer _text;
     private readonly BatteryChartPanel _chart = new();
+    private readonly ComboBox _devicePicker = new();
     private readonly Label _title = new();
     private readonly Label _summary = new();
     private readonly Label _estimate = new();
     private readonly Label _details = new();
     private TimeSpan _range = TimeSpan.FromDays(1);
+    private string? _selectedDeviceKey;
+    private bool _refreshingDevices;
 
     public BatteryHistoryWindow(BatteryHistoryStore store, Localizer text)
     {
@@ -154,8 +270,9 @@ internal sealed class BatteryHistoryWindow : Form
         ForeColor = Color.White;
         Font = new Font("Microsoft YaHei UI", 11F);
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(38), BackColor = BackColor, RowCount = 4, ColumnCount = 1 };
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(38), BackColor = BackColor, RowCount = 5, ColumnCount = 1 };
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 170));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 62));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 82));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 130));
@@ -177,17 +294,45 @@ internal sealed class BatteryHistoryWindow : Form
         header.Controls.Add(_estimate);
         root.Controls.Add(header, 0, 0);
 
+        var deviceBar = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = BackColor, ColumnCount = 2, Padding = new Padding(0, 0, 0, 14) };
+        deviceBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+        deviceBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        var deviceLabel = new Label
+        {
+            Text = _text.IsZh ? "鼠标" : "Mouse",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = Color.Gainsboro,
+            Font = new Font(Font.FontFamily, 14F)
+        };
+        _devicePicker.Dock = DockStyle.Fill;
+        _devicePicker.DropDownStyle = ComboBoxStyle.DropDownList;
+        _devicePicker.Font = new Font(Font.FontFamily, 13F);
+        _devicePicker.SelectedIndexChanged += (_, _) =>
+        {
+            if (_refreshingDevices)
+                return;
+            if (_devicePicker.SelectedItem is DevicePickerItem item)
+            {
+                _selectedDeviceKey = item.DeviceKey;
+                Reload();
+            }
+        };
+        deviceBar.Controls.Add(deviceLabel, 0, 0);
+        deviceBar.Controls.Add(_devicePicker, 1, 0);
+        root.Controls.Add(deviceBar, 0, 1);
+
         var rangeBar = new FlowLayoutPanel { Dock = DockStyle.Fill, BackColor = BackColor };
         AddRangeButton(rangeBar, _text["Last24Hours"], TimeSpan.FromDays(1), true);
         AddRangeButton(rangeBar, _text["Last7Days"], TimeSpan.FromDays(7), false);
         AddRangeButton(rangeBar, _text["Last30Days"], TimeSpan.FromDays(30), false);
-        root.Controls.Add(rangeBar, 0, 1);
+        root.Controls.Add(rangeBar, 0, 2);
 
         var chartCard = Card();
         chartCard.Padding = new Padding(28);
         _chart.Dock = DockStyle.Fill;
         chartCard.Controls.Add(_chart);
-        root.Controls.Add(chartCard, 0, 2);
+        root.Controls.Add(chartCard, 0, 3);
 
         var detailCard = Card();
         detailCard.Padding = new Padding(28, 18, 28, 18);
@@ -195,7 +340,7 @@ internal sealed class BatteryHistoryWindow : Form
         _details.Font = new Font(Font.FontFamily, 14F);
         _details.ForeColor = Color.White;
         detailCard.Controls.Add(_details);
-        root.Controls.Add(detailCard, 0, 3);
+        root.Controls.Add(detailCard, 0, 4);
 
         Load += (_, _) => ApplyDarkTitleBar();
         Reload();
@@ -203,8 +348,10 @@ internal sealed class BatteryHistoryWindow : Form
 
     public void Reload()
     {
-        var entries = _store.ReadLast(_range);
+        RefreshDevicePicker();
+        var entries = _store.ReadLast(_range, _selectedDeviceKey);
         _chart.SetData(entries, _range);
+
         var latest = entries.LastOrDefault();
         var first = entries.FirstOrDefault();
         var consumed = first != null && latest != null ? Math.Max(0, first.BatteryPercentage - latest.BatteryPercentage) : 0;
@@ -214,14 +361,59 @@ internal sealed class BatteryHistoryWindow : Form
         var estimateText = remainingHours > 0 ? $"{remainingHours / 24:0.0} d" : _text["HistoryUnavailable"];
         var charging = latest?.IsCharging == true || latest?.IsCableConnected == true;
         var lastCharge = entries.LastOrDefault(e => e.IsCharging || e.IsCableConnected)?.TimestampUtc.ToLocalTime();
+        var deviceName = CurrentDeviceName();
 
-        _title.Text = latest == null ? _text["AppName"] : $"{_text["AppName"]} · {latest.BatteryPercentage}%";
+        _title.Text = latest == null ? deviceName : $"{deviceName} · {latest.BatteryPercentage}%";
         _summary.Text = $"{(entries.Count == 0 ? _text["HistoryDemo"] : _text["HistoryRealData"])}\r\n{(charging ? _text["Charging"] : "")}";
         _summary.ForeColor = charging ? Color.FromArgb(88, 224, 112) : Color.Gainsboro;
         _estimate.Text = $"{_text["HistoryEstimate"]}\r\n{estimateText}";
         _details.Text =
             $"{_text["HistoryConsumed"]}: {consumed}%    {_text["HistoryAverage"]}: {average:0.0}%/h\r\n" +
             $"{_text["HistoryLastFull"]}: {(lastCharge.HasValue ? lastCharge.Value.ToString("MM-dd HH:mm") : _text["HistoryUnavailable"])}";
+    }
+
+    private void RefreshDevicePicker()
+    {
+        var previous = _selectedDeviceKey;
+        var devices = _store.ReadDevices(TimeSpan.FromDays(30));
+        _refreshingDevices = true;
+        try
+        {
+            _devicePicker.Items.Clear();
+            foreach (var device in devices)
+                _devicePicker.Items.Add(new DevicePickerItem(device, _text["Charging"]));
+
+            if (_devicePicker.Items.Count == 0)
+            {
+                _selectedDeviceKey = null;
+                _devicePicker.Enabled = false;
+                return;
+            }
+
+            _devicePicker.Enabled = true;
+            var selectedIndex = 0;
+            for (var i = 0; i < _devicePicker.Items.Count; i++)
+            {
+                if (_devicePicker.Items[i] is DevicePickerItem item && string.Equals(item.DeviceKey, previous, StringComparison.OrdinalIgnoreCase))
+                {
+                    selectedIndex = i;
+                    break;
+                }
+            }
+
+            _devicePicker.SelectedIndex = selectedIndex;
+            if (_devicePicker.SelectedItem is DevicePickerItem selected)
+                _selectedDeviceKey = selected.DeviceKey;
+        }
+        finally
+        {
+            _refreshingDevices = false;
+        }
+    }
+
+    private string CurrentDeviceName()
+    {
+        return _devicePicker.SelectedItem is DevicePickerItem item ? item.DeviceName : _text["AppName"];
     }
 
     private void AddRangeButton(FlowLayoutPanel parent, string label, TimeSpan range, bool isDefault)
@@ -258,6 +450,23 @@ internal sealed class BatteryHistoryWindow : Form
 
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
+    private sealed class DevicePickerItem
+    {
+        public DevicePickerItem(BatteryHistoryDevice device, string chargingText)
+        {
+            DeviceKey = device.DeviceKey;
+            DeviceName = device.DeviceName;
+            Text = device.IsCharging
+                ? $"{device.DeviceName} · {device.LastBatteryPercentage}% {chargingText}"
+                : $"{device.DeviceName} · {device.LastBatteryPercentage}%";
+        }
+
+        public string DeviceKey { get; }
+        public string DeviceName { get; }
+        private string Text { get; }
+        public override string ToString() => Text;
+    }
 }
 
 internal sealed class BatteryChartPanel : Control
