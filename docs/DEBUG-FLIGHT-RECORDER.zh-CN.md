@@ -24,7 +24,7 @@ Get-Content "$env:USERPROFILE\Documents\SoraV2BatteryTip\logs\flight-current.jso
 - `run_id`：本次启动 ID。
 - `op_id`：一次完整检测的关联 ID。
 - `level`、`event`、`component`、`outcome`：严重度、稳定事件名、来源组件、结果。
-- `device`：稳定关联 token、原始设备名称/path/serial、VID/PID、电量、电源状态、数据新鲜度和 provider。
+- `device`：稳定关联 token、逻辑鼠标 ID、电量曲线历史键、接收器关系键/序列号代际、历史关联证据（确认/恢复/拒绝）、当前连接方式、该读数覆盖的所有真实 HID 路径、原始设备名称/path/serial、VID/PID、`has_battery_percentage`、电量、电源/在线/充电/线缆状态、上次成功读取时间、连续失败次数、数据新鲜度和 provider。
 - `data`：该事件自己的白名单事实。
 - `error`：错误类别、异常类型、真实错误消息、HRESULT 和调用栈指纹。
 
@@ -32,21 +32,26 @@ Get-Content "$env:USERPROFILE\Documents\SoraV2BatteryTip\logs\flight-current.jso
 
 - `fact_basis=windows_wm_devicechange`：Windows 直接发送的 HID 到达/移除通知。
 - `fact_basis=provider_reading`：设备 provider 本次实际接受的读取结果。
+- `fact_basis=provider_logical_device_identity`：provider 已用硬件配对关系确认同一逻辑鼠标在接收器与有线端点之间切换。
 - `fact_basis=derived_from_consecutive_provider_readings`：比较同一设备前后两次读取后得到的插线、拔线、充电、电量等转变。
 - `fact_basis=application_icon_assignment`：程序确实把哪个图标设置到了托盘。
 
 provider 没有提供独立电缆位时，“插线”可能由充电位或外接电源位推导。日志会同时保留原始布尔事实与推导后的 `power_state`，避免把推导伪装成硬件直接上报。
+
+接收器配对的确认/拒绝属于设备身份事实，不依赖同一轮电量读取成功。它会以 `HasBatteryPercentage=false` 的身份记录持久化，用于跨重启阻止错误合并，但不会作为 `0%` 数据点进入电量曲线。飞行日志里的 `has_battery_percentage=false` 也明确表示该事件只有设备上下文，没有电量事实，此时 `last_successful_read_utc` 必须为 `null`，不会伪造本轮成功时间。
+
+接收器关系键按 HID 路径稳定，序列号用于划分物理接收器代际，电量曲线键则继续表示同一只鼠标的历史。每个关联范围只采用按时间最新的确认/拒绝事实；不同接收器关联互不误伤，同一路径被新序列号复用时旧关系会失效。30 天清理仅删除过期电量样本，会保留身份恢复所需的关系事实。
 
 ## 关键事件
 
 - 生命周期：`app.start`、`app.stop`、`app.previous_run_unclean`、`app.*exception`。
 - 检测：`poll.requested`、`poll.started`、`poll.completed`、`poll.failed`、`poll.cancelled`。
 - HID：`hid.inventory.*`、`system.device_arrival`、`system.device_removal`、`device_refresh.*`。
-- provider：`provider.read_*`、`provider.device_open_failed`、`provider.io_failed`、`provider.parse_rejected`。
-- 设备：`device.reading_observed`、`device.battery_changed`、`device.cable_connected`、`device.cable_disconnected`、`device.charging_started`、`device.charging_stopped`、`device.full_charge_reached`、`device.state_stale`、`device.state_recovered`、`device.state_offline`。
+- provider：`provider.read_*`、`provider.device_open_failed`、`provider.io_failed`、`provider.parse_rejected`、`provider.receiver_pair_*`、`provider.transport_plan`、`provider.transport_arbitrated`。
+- 设备：`device.identity_evidence_applied`、`device.history_anchor_recovery_blocked`、`device.identity_rekeyed`、`device.policy_state_rekeyed`、`device.policy_state_epoch_reset`、`device.reading_observed`、`device.transport_changed`、`device.battery_changed`、`device.cable_connected`、`device.cable_disconnected`、`device.charging_started`、`device.charging_stopped`、`device.full_charge_reached`、`device.state_stale`、`device.state_recovered`、`device.state_offline`。
 - UI：`tray.status_changed`、`tray.tooltip_changed`、`tray.icon_changed`、`poll.interval_changed`。
 - 提醒：`alert.fired`、`alert.reset`、`alert.suppressed`、`sound.*`。
-- 数据：`history.*`、`settings.*`、`profile.*`、`diagnostics.*`。
+- 数据：`history.*`（包括独立于电量成功与否的 `history.identity_evidence_*`）、`settings.*`、`profile.*`、`diagnostics.*`。
 
 ## 本机完整性与文件管理
 
@@ -56,6 +61,7 @@ provider 没有提供独立电缆位时，“插线”可能由充电位或外�
 - 单后台写线程保证多 provider 并行时仍是一行一个完整 JSON；日志写入失败不会拖垮鼠标程序。
 - 活动文件允许其他进程同时读取，但不允许第二个写入者交错破坏 JSONL。
 - 达到 4 MiB、跨 UTC 日期或程序重启时轮转；归档最多 14 天、12 个文件、32 MiB。
+- 配对不一致会留下两条可区分的身份事实：接收器自身当前序列号代际的确认，以及仅针对有线端点的配对拒绝；这样可以从日志中直接判断“接收器仍在但本轮读取失败”和“接收器已经被替换”。
 
 ## 提交问题时
 

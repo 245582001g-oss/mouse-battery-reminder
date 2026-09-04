@@ -98,6 +98,7 @@ internal sealed class BatteryProviderManager
                 ProviderName = _providers[i].Name,
                 Priority = _providers[i].Priority,
                 Readings = batch.Readings,
+                IdentityObservations = batch.IdentityObservations,
                 CandidateFound = batch.CandidateFound,
                 CandidateDeviceIds = batch.CandidateDeviceIds,
                 Error = batch.Error
@@ -134,6 +135,7 @@ internal sealed class BatteryProviderManager
             {
                 duration_ms = started.ElapsedMilliseconds,
                 reading_count = readings.Count,
+                identity_observation_count = providerResults.Sum(batch => batch.IdentityObservations.Count),
                 candidate_provider_count = candidateProviders.Count,
                 inventory_reliable = inventory.IsReliable
             });
@@ -153,6 +155,7 @@ internal sealed class BatteryProviderManager
         {
             duration_ms = started.ElapsedMilliseconds,
             reading_count = 0,
+            identity_observation_count = providerResults.Sum(batch => batch.IdentityObservations.Count),
             candidate_provider_count = candidateProviders.Count,
             inventory_reliable = inventory.IsReliable,
             failure_reason = failureReason
@@ -187,6 +190,7 @@ internal sealed class BatteryProviderManager
                     candidate_tokens = result.CandidateDeviceIds.Select(value => _log?.TokenFor(value, "dev") ?? "dev_redacted").ToArray(),
                     candidate_device_ids = result.CandidateDeviceIds,
                     reading_count = result.Readings.Count,
+                    identity_observation_count = result.IdentityObservations.Count,
                     error_code = result.Error
                 });
             return result;
@@ -207,6 +211,11 @@ internal sealed class BatteryProviderManager
     {
         foreach (var existing in existingReadings)
         {
+            if (!string.IsNullOrWhiteSpace(candidate.LogicalDeviceId)
+                && !string.IsNullOrWhiteSpace(existing.LogicalDeviceId)
+                && string.Equals(candidate.LogicalDeviceId, existing.LogicalDeviceId, StringComparison.OrdinalIgnoreCase))
+                return true;
+
             if (!string.IsNullOrWhiteSpace(candidate.DeviceId)
                 && !string.IsNullOrWhiteSpace(existing.DeviceId)
                 && string.Equals(candidate.DeviceId, existing.DeviceId, StringComparison.OrdinalIgnoreCase))

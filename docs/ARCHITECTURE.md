@@ -129,6 +129,7 @@ The app prefers verified built-in protocols first. Local learned profiles are us
 Windows device/power notifications
 -> HidDeviceInventory (reliable snapshot cache; short retry TTL for failures)
 -> BatteryProviderManager (parallel provider reads and per-device deduplication)
+-> NinjutsoSoraTransportPolicy (verified receiver pairing and wired-endpoint arbitration)
 -> DeviceBatteryStateStore (multi-device merge, transient-failure retention, offline/rekey transitions)
 -> DevicePowerSemantics (one definition of external power, charging, and full charge)
 -> BatteryHistoryStore / LowBatteryAlertTracker / ChargingPollingPolicy
@@ -138,6 +139,12 @@ Windows device/power notifications
 Every important branch also emits a structured event to `FlightRecorder`. The recorder owns its background writer; business code never writes the log file directly. Events from one poll share an `op_id`; each device carries both a stable correlation token and its original name/path/serial, so Windows notifications, actual provider reads, derived state transitions, alert decisions, and icon assignments can be reconstructed directly.
 
 When a device's runtime identity changes—such as a new path after reconnection or a placeholder serial being promoted to a real serial—the state store emits an explicit identity transition. Alert and charging-policy state move with it so one physical mouse is not treated as a new device.
+
+For a verified SORA V2 receiver/direct pair, the provider emits one logical device while retaining both raw HID paths as resolved endpoints. This keeps battery history, alerts, polling, USB arrival/removal handling, and flight-recorder correlation continuous while transport changes from `Receiver` to `WiredUsb` and back.
+
+The identity layer keeps the battery-curve key, path-stable receiver association, and stable-serial epoch separate. Each physical path retains the latest `ConfirmReceiver` / `RejectPersistedReceiver` fact by time, and wired-only recovery uses only a currently valid confirmation. Replacing a receiver starts a fresh alert and charging-polling epoch instead of inheriting suppression or fast-window state from the old device.
+
+When a pairing mismatch is observed, the provider records both a confirmation for the receiver's own current serial epoch and a rejection scoped only to the wired pairing endpoint. A receiver that is still physically present therefore remains identifiable even if its battery read fails in that poll.
 
 ## Data directory
 

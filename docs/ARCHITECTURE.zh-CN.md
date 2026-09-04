@@ -129,6 +129,7 @@ NinjutsoSoraOfficialProvider
 Windows 设备/电源通知
 -> HidDeviceInventory（可靠快照缓存，失败快照短时重试）
 -> BatteryProviderManager（并行 provider 读取与按设备去重）
+-> NinjutsoSoraTransportPolicy（已验证的接收器配对与有线端点仲裁）
 -> DeviceBatteryStateStore（多设备合并、短时失败保留、离线与身份迁移）
 -> DevicePowerSemantics（统一插线、充电与满电语义）
 -> BatteryHistoryStore / LowBatteryAlertTracker / ChargingPollingPolicy
@@ -138,6 +139,12 @@ Windows 设备/电源通知
 所有关键分支同时向 `FlightRecorder` 发送结构化事件。记录器使用独立后台写线程；业务代码不直接写日志文件。一次检测的事件共享 `op_id`，设备同时带稳定关联 token 与原始名称/path/serial，因此可以直接还原 Windows 通知、实际 provider 读取、状态推导、提醒决定与图标赋值之间的完整顺序。
 
 设备运行身份变化（例如重连后的新 path，或序列号从占位值升级为真实值）会由状态存储显式上报，并同步迁移低电量提醒与充电轮询状态，避免把同一只鼠标误当成新设备。
+
+对已经验证配对关系的 SORA V2 接收器/直连端点，provider 只输出一个逻辑设备，同时保留两条原始 HID 路径作为该读数覆盖的端点。这样在 `Receiver` 与 `WiredUsb` 之间切换时，电量历史、提醒、轮询、USB 插拔刷新和飞行日志关联都保持连续。
+
+身份层把电量曲线键、接收器路径关联键和稳定序列号代际分开处理。每个物理路径按时间保留最新的 `ConfirmReceiver` / `RejectPersistedReceiver` 事实；有线单端点恢复只采用当前仍有效的确认关系。换接收器时会开启新的提醒与充电轮询代际，不继承旧设备的告警抑制或快轮询状态。
+
+发现配对不一致时，provider 会同时记录“接收器自身当前序列号代际”的确认事实，以及仅作用于有线配对端点的拒绝事实。因此，即使接收器在这一轮电量读取失败，只要仍然实际在场，也不会被错误地当成离线设备。
 
 ## 数据目录
 

@@ -6,10 +6,10 @@
     <AssemblyName>SoraV2BatteryTip</AssemblyName>
     <AssemblyTitle>鼠标电量提醒</AssemblyTitle>
     <Product>鼠标电量提醒</Product>
-    <Version>0.4.0</Version>
-    <AssemblyVersion>0.4.0.0</AssemblyVersion>
-    <FileVersion>0.4.0.0</FileVersion>
-    <InformationalVersion>0.4.0-flight-recorder</InformationalVersion>
+    <Version>0.4.1</Version>
+    <AssemblyVersion>0.4.1.0</AssemblyVersion>
+    <FileVersion>0.4.1.0</FileVersion>
+    <InformationalVersion>0.4.1-sora-transport-arbitration</InformationalVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWindowsForms>true</UseWindowsForms>

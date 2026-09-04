@@ -116,7 +116,9 @@ internal sealed class CompxBatteryProvider : IBatteryProvider
     private static BatteryReading DeviceForLog(HidDevice device) => new()
     {
         HasBatteryPercentage = false,
+        DeviceName = Safe(() => device.GetProductName()),
         DeviceId = Safe(() => device.DevicePath),
+        DeviceSerial = Safe(() => device.GetSerialNumber()),
         VendorId = $"0x{device.VendorID:X4}",
         ProductId = $"0x{device.ProductID:X4}",
         Source = "ATK/COMPX HID"

@@ -175,6 +175,34 @@ internal sealed class FlightRecorder : IAppEventLog
     {
         try
         {
+            if (!string.IsNullOrWhiteSpace(reading.AssociationReceiverHistoryKey))
+            {
+                var receiverSerial = DeviceIdentity.NormalizeSerial(reading.AssociationReceiverSerial)
+                    ?? (reading.ConnectionTransport == DeviceConnectionTransport.Receiver
+                        ? DeviceIdentity.NormalizeSerial(reading.DeviceSerial)
+                        : null);
+                return TokenFor(
+                    receiverSerial == null
+                        ? $"receiver:{reading.AssociationReceiverHistoryKey}"
+                        : $"receiver:{reading.AssociationReceiverHistoryKey}:serial:{receiverSerial}",
+                    "dev");
+            }
+
+            if (!string.IsNullOrWhiteSpace(reading.LogicalDeviceId))
+            {
+                var logicalDeviceId = reading.LogicalDeviceId.Trim();
+                var receiverSerial = logicalDeviceId.StartsWith(
+                        "ninjutso-sora-v2:receiver:",
+                        StringComparison.OrdinalIgnoreCase)
+                    ? DeviceIdentity.NormalizeSerial(reading.DeviceSerial)
+                    : null;
+                return TokenFor(
+                    receiverSerial == null
+                        ? $"logical:{logicalDeviceId}"
+                        : $"logical:{logicalDeviceId}:receiver-serial:{receiverSerial}",
+                    "dev");
+            }
+
             var serial = DeviceIdentity.NormalizeSerial(reading.DeviceSerial);
             if (!string.IsNullOrEmpty(serial))
                 return TokenFor($"serial:{reading.VendorId}:{reading.ProductId}:{serial}", "dev");
@@ -910,13 +938,54 @@ internal sealed class FlightRecorder : IAppEventLog
         var rawId = ReadString(device, "id");
         writer.WriteString("id", PreserveOpaqueTokenOrTokenize(rawId, "dev"));
         writer.WriteString("name", SanitizeString(ReadString(device, "name"), 512));
+        writer.WriteString("logical_id", SanitizeString(ReadString(device, "logical_id"), 2048));
+        writer.WriteString("history_key", SanitizeString(ReadString(device, "history_key"), 2048));
+        writer.WriteString(
+            "receiver_association_key",
+            SanitizeString(ReadString(device, "receiver_association_key"), 2048));
+        writer.WriteString(
+            "receiver_association_serial",
+            SanitizeString(ReadString(device, "receiver_association_serial"), 512));
+        writer.WriteString(
+            "history_anchor_evidence",
+            SanitizeEnvelopeValue(ReadString(device, "history_anchor_evidence"), "none", 48, "history_anchor_evidence"));
+        writer.WriteString(
+            "transport",
+            SanitizeEnvelopeValue(ReadString(device, "transport"), "unknown", 32, "transport"));
         writer.WriteString("path", SanitizeString(ReadString(device, "path"), 2048));
+        writer.WriteStartArray("resolved_paths");
+        if (device.TryGetProperty("resolved_paths", out var resolvedPaths)
+            && resolvedPaths.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var resolvedPath in resolvedPaths.EnumerateArray())
+            {
+                if (resolvedPath.ValueKind == JsonValueKind.String)
+                    writer.WriteStringValue(SanitizeString(resolvedPath.GetString(), 2048));
+            }
+        }
+        writer.WriteEndArray();
         writer.WriteString("serial", SanitizeString(ReadString(device, "serial"), 512));
         if (!string.IsNullOrWhiteSpace(rawId) && !IsOpaqueToken(rawId, "dev"))
             writer.WriteString("legacy_id", SanitizeString(rawId, 2048));
         writer.WriteString("vendor_id", SanitizeUsbIdentifier(ReadString(device, "vendor_id")));
         writer.WriteString("product_id", SanitizeUsbIdentifier(ReadString(device, "product_id")));
-        writer.WriteNumber("battery_percentage", Math.Clamp(ReadInt32(device, "battery_percentage", 0), 0, 100));
+        var projectedBatteryPercentage = Math.Clamp(ReadInt32(device, "battery_percentage", 0), 0, 100);
+        var projectedHasBatteryPercentage = ReadBoolean(
+            device,
+            "has_battery_percentage",
+            projectedBatteryPercentage is >= 1 and <= 100);
+        writer.WriteBoolean("has_battery_percentage", projectedHasBatteryPercentage);
+        writer.WriteNumber("battery_percentage", projectedBatteryPercentage);
+        WriteProjectedBooleanOrNull(writer, device, "is_online");
+        WriteProjectedBooleanOrNull(writer, device, "is_charging");
+        WriteProjectedBooleanOrNull(writer, device, "is_fully_charged");
+        WriteProjectedBooleanOrNull(writer, device, "is_cable_connected");
+        WriteProjectedBooleanOrNull(writer, device, "external_power_connected");
+        if (projectedHasBatteryPercentage)
+            writer.WriteString("last_successful_read_utc", SanitizeString(ReadString(device, "last_successful_read_utc"), 64));
+        else
+            writer.WriteNull("last_successful_read_utc");
+        writer.WriteNumber("consecutive_failures", Math.Max(0, ReadInt32(device, "consecutive_failures", 0)));
         writer.WriteString(
             "power_state",
             SanitizeEnvelopeValue(ReadString(device, "power_state"), "unknown", 32, "power"));
@@ -1005,6 +1074,26 @@ internal sealed class FlightRecorder : IAppEventLog
             && value.TryGetInt32(out var parsed)
             ? parsed
             : fallback;
+    }
+
+    private static bool ReadBoolean(JsonElement root, string propertyName, bool fallback)
+    {
+        return root.TryGetProperty(propertyName, out var value)
+            && value.ValueKind is JsonValueKind.True or JsonValueKind.False
+            ? value.GetBoolean()
+            : fallback;
+    }
+
+    private static void WriteProjectedBooleanOrNull(
+        Utf8JsonWriter writer,
+        JsonElement root,
+        string propertyName)
+    {
+        if (root.TryGetProperty(propertyName, out var value)
+            && value.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            writer.WriteBoolean(propertyName, value.GetBoolean());
+        else
+            writer.WriteNull(propertyName);
     }
 
     private bool AppendEmergencyLine(string path, string line)
@@ -1203,11 +1292,35 @@ internal sealed class FlightRecorder : IAppEventLog
         writer.WriteStartObject();
         writer.WriteString("id", DeviceToken(reading));
         writer.WriteString("name", SanitizeString(reading.DeviceName, 512));
+        writer.WriteString("logical_id", SanitizeString(reading.LogicalDeviceId, 2048));
+        writer.WriteString("history_key", SanitizeString(reading.HistoryDeviceKey, 2048));
+        writer.WriteString("receiver_association_key", SanitizeString(reading.AssociationReceiverHistoryKey, 2048));
+        writer.WriteString("receiver_association_serial", SanitizeString(reading.AssociationReceiverSerial, 512));
+        writer.WriteString("history_anchor_evidence", reading.HistoryAnchorEvidence.ToString().ToLowerInvariant());
+        writer.WriteString("transport", reading.ConnectionTransport.ToString().ToLowerInvariant());
         writer.WriteString("path", SanitizeString(reading.DeviceId, 2048));
+        writer.WriteStartArray("resolved_paths");
+        foreach (var deviceId in DeviceIdentity.ResolvedDeviceIds(reading))
+            writer.WriteStringValue(SanitizeString(deviceId, 2048));
+        writer.WriteEndArray();
         writer.WriteString("serial", SanitizeString(reading.DeviceSerial, 512));
         writer.WriteString("vendor_id", SanitizeUsbIdentifier(reading.VendorId));
         writer.WriteString("product_id", SanitizeUsbIdentifier(reading.ProductId));
+        writer.WriteBoolean("has_battery_percentage", reading.HasBatteryPercentage);
         writer.WriteNumber("battery_percentage", Math.Clamp(reading.BatteryPercentage, 0, 100));
+        writer.WriteBoolean("is_online", reading.IsOnline);
+        writer.WriteBoolean("is_charging", reading.IsCharging);
+        writer.WriteBoolean("is_fully_charged", reading.IsFullyCharged);
+        writer.WriteBoolean("is_cable_connected", reading.IsCableConnected);
+        if (reading.ExternalPowerConnected.HasValue)
+            writer.WriteBoolean("external_power_connected", reading.ExternalPowerConnected.Value);
+        else
+            writer.WriteNull("external_power_connected");
+        if (reading.HasBatteryPercentage)
+            writer.WriteString("last_successful_read_utc", reading.LastSuccessfulReadUtc.ToUniversalTime());
+        else
+            writer.WriteNull("last_successful_read_utc");
+        writer.WriteNumber("consecutive_failures", Math.Max(0, reading.ConsecutiveFailures));
         writer.WriteString("power_state", reading.PowerState.ToString().ToLowerInvariant());
         writer.WriteString("freshness", reading.Freshness.ToString().ToLowerInvariant());
         writer.WriteString("source", SanitizeEnvelopeValue(reading.Source, "unknown", 96, "source"));

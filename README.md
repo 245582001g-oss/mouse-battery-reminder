@@ -44,6 +44,12 @@ Battery byte:       response[9]
 Charging byte:      response[10] == 1
 ```
 
+For the SORA family, `0xAE1C`, `0xAE8A`, and `0xAE8C` are known receiver transports, while `0xAE11`-`0xAE16` are direct mouse transports. When exactly one receiver and one wired endpoint are enumerated, and the receiver's official `0x28` pairing query returns the wired endpoint's product PID, the app treats both HID paths as one logical mouse. The wired endpoint becomes authoritative while the cable is connected, so receiver-side placeholder values such as `0` or `100` cannot override the real wired battery or charging icon. Removing the cable switches the same logical mouse back to its receiver without creating an offline/second-device transition.
+
+The pairing relation is retained as a path-stable receiver association plus a stable-serial epoch. A replaced receiver, failed pairing read, or app restart therefore cannot attach an old receiver's curve or state to the current mouse. The battery-curve key remains separate from the receiver relation, and the 30-day battery prune retains the latest identity confirmation/rejection facts needed for recovery.
+
+The firmware's `0x28` response exposes only the product PID, not a unique mouse identity. If the endpoints also lack distinct stable serials, two independent SORA mice with the same PID in the exact one-receiver/one-wired topology cannot be distinguished unambiguously by the protocol. With more than two candidate endpoints, the app keeps them independent instead of pairing by enumeration order.
+
 The older learned `draft-1915-*` profiles are intentionally ignored when this built-in provider matches, so SORA V2 does not depend on a guessed offset anymore.
 
 ### ATK / COMPX HID
@@ -142,12 +148,12 @@ Get-Content "$env:USERPROFILE\Documents\SoraV2BatteryTip\logs\flight-current.jso
 Each JSONL event contains UTC and local timestamps, monotonic elapsed time, a per-run sequence number, a run ID, and an operation ID that ties one battery check together. Important events include:
 
 - HID/USB arrival and removal, suspend/resume, and display power changes.
-- Provider candidates, reads, timeouts, parse rejection, retry, and recovery.
+- Provider candidates, reads, timeouts, parse rejection, retry, recovery, receiver pairing, and endpoint arbitration.
 - Battery level, cable, charging, full-charge, stale, recovered, and offline transitions.
 - Low-battery alert decisions, sound playback, polling interval changes, and every tray icon change.
 - Settings, profile tools, diagnostics export, normal shutdown, and unhandled crashes.
 
-This is a local, facts-first diagnostic log. Device records include both a stable correlation token and the original device name, HID path, and serial number; exception records include the real error message. Provider HID request/response payloads are not added separately. The live log rotates at 4 MiB or at a UTC date boundary; archives are limited to 14 days, 12 files, and 32 MiB. Right-click the tray icon and choose **Open DEBUG Log Folder** to reach it. A diagnostics export retains local state, settings, profiles, HID inventory, battery history, and a size-limited log snapshot. Inspect it yourself before sharing it with anyone else.
+This is a local, facts-first diagnostic log. Device records include a stable correlation token, receiver relation/serial epoch, and the original device name, HID path, and serial number. `has_battery_percentage` explicitly distinguishes a real zero from an event that has no battery fact; exception records include the real error message. Provider HID request/response payloads are not added separately. The live log rotates at 4 MiB or at a UTC date boundary; archives are limited to 14 days, 12 files, and 32 MiB. Right-click the tray icon and choose **Open DEBUG Log Folder** to reach it. A diagnostics export retains local state, settings, profiles, HID inventory, battery history, and a size-limited log snapshot. Inspect it yourself before sharing it with anyone else.
 
 The full event and evidence guide is in [docs/DEBUG-FLIGHT-RECORDER.zh-CN.md](docs/DEBUG-FLIGHT-RECORDER.zh-CN.md).
 

@@ -17,6 +17,21 @@ internal enum BatteryDataFreshness
     Stale
 }
 
+internal enum DeviceConnectionTransport
+{
+    Unknown,
+    Receiver,
+    WiredUsb
+}
+
+internal enum HistoryAnchorEvidence
+{
+    None,
+    ConfirmReceiver,
+    RecoverPersistedReceiver,
+    RejectPersistedReceiver
+}
+
 internal sealed class BatteryReading
 {
     public int BatteryPercentage { get; init; }
@@ -31,6 +46,13 @@ internal sealed class BatteryReading
     public DateTime LastSuccessfulReadUtc { get; init; } = DateTime.UtcNow;
     public int ConsecutiveFailures { get; init; }
     public string ProviderName { get; init; } = "";
+    public string LogicalDeviceId { get; init; } = "";
+    public string HistoryDeviceKey { get; init; } = "";
+    public string AssociationReceiverHistoryKey { get; init; } = "";
+    public string AssociationReceiverSerial { get; init; } = "";
+    public DeviceConnectionTransport ConnectionTransport { get; init; }
+    public HistoryAnchorEvidence HistoryAnchorEvidence { get; init; }
+    public IReadOnlyList<string> ResolvedDeviceIds { get; init; } = Array.Empty<string>();
     public string DeviceName { get; init; } = "";
     public string DeviceId { get; init; } = "";
     public string DeviceSerial { get; init; } = "";
@@ -51,9 +73,27 @@ internal sealed class BatteryReadAllResult
     public bool Success => Readings.Count > 0;
 }
 
+internal sealed class DeviceIdentityObservation
+{
+    public string LogicalDeviceId { get; init; } = "";
+    public string HistoryDeviceKey { get; init; } = "";
+    public string AssociationReceiverHistoryKey { get; init; } = "";
+    public string AssociationReceiverSerial { get; init; } = "";
+    public HistoryAnchorEvidence HistoryAnchorEvidence { get; init; }
+    public IReadOnlyList<string> ResolvedDeviceIds { get; init; } = Array.Empty<string>();
+    public string DeviceName { get; init; } = "";
+    public string DeviceId { get; init; } = "";
+    public string DeviceSerial { get; init; } = "";
+    public string VendorId { get; init; } = "";
+    public string ProductId { get; init; } = "";
+    public string Source { get; init; } = "unknown";
+    public DateTime TimestampUtc { get; init; } = DateTime.UtcNow;
+}
+
 internal sealed class ProviderReadResult
 {
     public IReadOnlyList<BatteryReading> Readings { get; init; } = Array.Empty<BatteryReading>();
+    public IReadOnlyList<DeviceIdentityObservation> IdentityObservations { get; init; } = Array.Empty<DeviceIdentityObservation>();
     public bool CandidateFound { get; init; }
     public IReadOnlyList<string> CandidateDeviceIds { get; init; } = Array.Empty<string>();
     public string Error { get; init; } = "";
@@ -64,6 +104,7 @@ internal sealed class ProviderBatchResult
     public string ProviderName { get; init; } = "";
     public int Priority { get; init; }
     public IReadOnlyList<BatteryReading> Readings { get; init; } = Array.Empty<BatteryReading>();
+    public IReadOnlyList<DeviceIdentityObservation> IdentityObservations { get; init; } = Array.Empty<DeviceIdentityObservation>();
     public bool CandidateFound { get; init; }
     public IReadOnlyList<string> CandidateDeviceIds { get; init; } = Array.Empty<string>();
     public string Error { get; init; } = "";

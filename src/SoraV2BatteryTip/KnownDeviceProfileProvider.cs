@@ -432,7 +432,9 @@ internal sealed class KnownDeviceProfileProvider : IBatteryProvider
     private static BatteryReading DeviceForLog(HidDevice device, DeviceProfile profile) => new()
     {
         HasBatteryPercentage = false,
+        DeviceName = Safe(() => device.GetProductName()),
         DeviceId = Safe(() => device.DevicePath),
+        DeviceSerial = Safe(() => device.GetSerialNumber()),
         VendorId = $"0x{device.VendorID:X4}",
         ProductId = $"0x{device.ProductID:X4}",
         Source = string.IsNullOrWhiteSpace(profile.Name) ? "Known device profile" : profile.Name

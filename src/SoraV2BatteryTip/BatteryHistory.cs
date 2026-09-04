@@ -11,9 +11,17 @@ internal sealed class BatteryHistoryEntry
     public DateTime TimestampUtc { get; set; }
     public string DeviceKey { get; set; } = "";
     public string DeviceName { get; set; } = "";
+    public string LogicalDeviceId { get; set; } = "";
+    public string AssociationReceiverHistoryKey { get; set; } = "";
+    public string AssociationReceiverSerial { get; set; } = "";
+    public string ReceiverCanonicalHistoryKey { get; set; } = "";
+    public string ConnectionTransport { get; set; } = "";
+    public string HistoryAnchorEvidence { get; set; } = "";
+    public IReadOnlyList<string> ResolvedDeviceIds { get; set; } = Array.Empty<string>();
     public string DeviceSerial { get; set; } = "";
     public string VendorId { get; set; } = "";
     public string ProductId { get; set; } = "";
+    public bool HasBatteryPercentage { get; set; } = true;
     public int BatteryPercentage { get; set; }
     public bool IsCharging { get; set; }
     public bool IsCableConnected { get; set; }
@@ -34,12 +42,14 @@ internal sealed class BatteryHistoryDevice
 
 internal sealed class BatteryHistoryStore
 {
+    private const string SoraReceiverLogicalPrefix = "ninjutso-sora-v2:receiver:";
+    private const string SoraWiredLogicalPrefix = "ninjutso-sora-v2:wired:";
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = false };
     private readonly AppPaths _paths;
     private readonly IAppEventLog? _log;
     private readonly object _sync = new();
     private readonly Dictionary<string, BatteryHistoryEntry> _lastByDevice = new(StringComparer.OrdinalIgnoreCase);
-    private readonly HashSet<string> _legacyMigrationChecked = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, List<SoraHistoryAnchor>> _soraHistoryRelationsByPath = new(StringComparer.OrdinalIgnoreCase);
     private bool _lastCacheLoaded;
     private DateTime _lastPruneDateUtc = DateTime.MinValue;
 
@@ -63,6 +73,13 @@ internal sealed class BatteryHistoryStore
             TimestampUtc = DateTime.UtcNow,
             DeviceKey = deviceKey,
             DeviceName = DisplayDeviceName(reading),
+            LogicalDeviceId = reading.LogicalDeviceId,
+            AssociationReceiverHistoryKey = reading.AssociationReceiverHistoryKey,
+            AssociationReceiverSerial = DeviceIdentity.NormalizeSerial(reading.AssociationReceiverSerial) ?? "",
+            ReceiverCanonicalHistoryKey = IsSoraReceiverDeviceKey(deviceKey) ? deviceKey : "",
+            ConnectionTransport = reading.ConnectionTransport.ToString(),
+            HistoryAnchorEvidence = reading.HistoryAnchorEvidence.ToString(),
+            ResolvedDeviceIds = DeviceIdentity.ResolvedDeviceIds(reading),
             DeviceSerial = DeviceIdentity.NormalizeSerial(reading.DeviceSerial) ?? "",
             VendorId = NormalizeId(reading.VendorId),
             ProductId = NormalizeId(reading.ProductId),
@@ -71,7 +88,7 @@ internal sealed class BatteryHistoryStore
             IsCableConnected = DevicePowerSemantics.IsExternallyPowered(reading),
             State = "sample",
             Source = reading.Source
-        });
+        }, CreateLegacyAliasKeys(reading));
     }
 
     public void MarkOffline(BatteryReading reading)
@@ -85,6 +102,13 @@ internal sealed class BatteryHistoryStore
             TimestampUtc = DateTime.UtcNow,
             DeviceKey = deviceKey,
             DeviceName = DisplayDeviceName(reading),
+            LogicalDeviceId = reading.LogicalDeviceId,
+            AssociationReceiverHistoryKey = reading.AssociationReceiverHistoryKey,
+            AssociationReceiverSerial = DeviceIdentity.NormalizeSerial(reading.AssociationReceiverSerial) ?? "",
+            ReceiverCanonicalHistoryKey = IsSoraReceiverDeviceKey(deviceKey) ? deviceKey : "",
+            ConnectionTransport = reading.ConnectionTransport.ToString(),
+            HistoryAnchorEvidence = reading.HistoryAnchorEvidence.ToString(),
+            ResolvedDeviceIds = DeviceIdentity.ResolvedDeviceIds(reading),
             DeviceSerial = DeviceIdentity.NormalizeSerial(reading.DeviceSerial) ?? "",
             VendorId = NormalizeId(reading.VendorId),
             ProductId = NormalizeId(reading.ProductId),
@@ -93,7 +117,81 @@ internal sealed class BatteryHistoryStore
             IsCableConnected = false,
             State = "device_offline",
             Source = reading.Source
-        });
+        }, CreateLegacyAliasKeys(reading), migrateLegacyAliases: false);
+    }
+
+    public void RecordIdentityEvidence(DeviceIdentityObservation observation)
+    {
+        if (observation.HistoryAnchorEvidence is not (HistoryAnchorEvidence.ConfirmReceiver
+            or HistoryAnchorEvidence.RejectPersistedReceiver)
+            || string.IsNullOrWhiteSpace(observation.HistoryDeviceKey)
+            || observation.ResolvedDeviceIds.Count == 0)
+            return;
+
+        lock (_sync)
+        {
+            try
+            {
+                _paths.Ensure();
+                PruneOldEntriesIfDue();
+                EnsureLastCacheLoaded();
+                var entry = new BatteryHistoryEntry
+                {
+                    TimestampUtc = observation.TimestampUtc,
+                    DeviceKey = observation.HistoryDeviceKey,
+                    DeviceName = string.IsNullOrWhiteSpace(observation.DeviceName)
+                        ? observation.Source
+                        : observation.DeviceName,
+                    LogicalDeviceId = observation.LogicalDeviceId,
+                    AssociationReceiverHistoryKey = observation.AssociationReceiverHistoryKey,
+                    AssociationReceiverSerial = DeviceIdentity.NormalizeSerial(observation.AssociationReceiverSerial) ?? "",
+                    ReceiverCanonicalHistoryKey = observation.HistoryAnchorEvidence == HistoryAnchorEvidence.ConfirmReceiver
+                        && IsSoraReceiverDeviceKey(observation.HistoryDeviceKey)
+                            ? observation.HistoryDeviceKey
+                            : "",
+                    ConnectionTransport = NinjutsoSoraTransportPolicy.GetTransport(
+                        ParseProductId(observation.ProductId)).ToString(),
+                    HistoryAnchorEvidence = observation.HistoryAnchorEvidence.ToString(),
+                    ResolvedDeviceIds = IdentityEvidencePaths(observation),
+                    DeviceSerial = DeviceIdentity.NormalizeSerial(observation.DeviceSerial) ?? "",
+                    VendorId = NormalizeId(observation.VendorId),
+                    ProductId = NormalizeId(observation.ProductId),
+                    HasBatteryPercentage = false,
+                    State = observation.HistoryAnchorEvidence == HistoryAnchorEvidence.RejectPersistedReceiver
+                        ? "identity_anchor_rejected"
+                        : "identity_anchor_confirmed",
+                    Source = observation.Source
+                };
+                PrepareReceiverCanonicalIdentity(entry);
+                if (IdentityEvidenceAlreadyCurrent(entry))
+                {
+                    _log?.Write("debug", "history.identity_evidence_duplicate", nameof(BatteryHistoryStore), "skipped", new
+                    {
+                        device_key = entry.DeviceKey,
+                        receiver_association_key = entry.AssociationReceiverHistoryKey,
+                        history_anchor_evidence = entry.HistoryAnchorEvidence,
+                        resolved_device_ids = entry.ResolvedDeviceIds
+                    }, reading: IdentityObservationForLog(observation));
+                    return;
+                }
+
+                File.AppendAllText(_paths.HistoryPath, JsonSerializer.Serialize(entry, JsonOptions) + Environment.NewLine);
+                RememberSoraHistoryAnchor(entry);
+                _log?.Write("info", "history.identity_evidence_recorded", nameof(BatteryHistoryStore), "success", new
+                    {
+                        device_key = entry.DeviceKey,
+                        receiver_association_key = entry.AssociationReceiverHistoryKey,
+                        history_event = entry.State,
+                    history_anchor_evidence = entry.HistoryAnchorEvidence,
+                    resolved_device_ids = entry.ResolvedDeviceIds,
+                    battery_fact_present = false
+                }, reading: IdentityObservationForLog(observation));
+            }
+            catch (Exception ex)
+            {
+                _log?.Write("error", "history.identity_evidence_failed", nameof(BatteryHistoryStore), "failure", exception: ex);
+            }
+        }
     }
 
     public IReadOnlyList<BatteryHistoryEntry> ReadLast(TimeSpan range, string? deviceKey)
@@ -106,6 +204,7 @@ internal sealed class BatteryHistoryStore
             PruneOldEntriesIfDue();
             var fromUtc = DateTime.UtcNow - range;
             return ReadEntries(fromUtc)
+                .Where(entry => entry.HasBatteryPercentage)
                 .Where(entry => string.Equals(entry.DeviceKey, deviceKey, StringComparison.OrdinalIgnoreCase))
                 .OrderBy(entry => entry.TimestampUtc)
                 .ToArray();
@@ -122,6 +221,8 @@ internal sealed class BatteryHistoryStore
 
             foreach (var entry in ReadEntries(fromUtc))
             {
+                if (!entry.HasBatteryPercentage)
+                    continue;
                 if (!latestByDevice.TryGetValue(entry.DeviceKey, out var previous) || entry.TimestampUtc > previous.TimestampUtc)
                     latestByDevice[entry.DeviceKey] = entry;
             }
@@ -142,7 +243,10 @@ internal sealed class BatteryHistoryStore
         }
     }
 
-    private void AppendRaw(BatteryHistoryEntry entry)
+    private void AppendRaw(
+        BatteryHistoryEntry entry,
+        IReadOnlyCollection<string> legacyAliasKeys,
+        bool migrateLegacyAliases = true)
     {
         lock (_sync)
         {
@@ -150,10 +254,17 @@ internal sealed class BatteryHistoryStore
             {
                 _paths.Ensure();
                 PruneOldEntriesIfDue();
-                MigrateLegacyEntries(entry);
+                EnsureLastCacheLoaded();
+                PrepareReceiverCanonicalIdentity(entry);
+                AdoptKnownSoraReceiverHistoryKey(entry);
+                if (migrateLegacyAliases)
+                    MigrateLegacyEntries(entry, legacyAliasKeys);
                 EnsureLastCacheLoaded();
                 _lastByDevice.TryGetValue(entry.DeviceKey, out var previous);
                 entry.State = DetermineEvent(previous, entry);
+                if ((string.IsNullOrEmpty(entry.State) || entry.State == "heartbeat")
+                    && RestoresRejectedSoraAnchor(entry))
+                    entry.State = "transport_change";
                 if (string.IsNullOrEmpty(entry.State))
                 {
                     _log?.Write("debug", "history.suppressed_duplicate", nameof(BatteryHistoryStore), "skipped", new
@@ -166,6 +277,7 @@ internal sealed class BatteryHistoryStore
 
                 File.AppendAllText(_paths.HistoryPath, JsonSerializer.Serialize(entry, JsonOptions) + Environment.NewLine);
                 _lastByDevice[entry.DeviceKey] = entry;
+                RememberSoraHistoryAnchor(entry);
                 _log?.Write("debug", "history.appended", nameof(BatteryHistoryStore), "success", new
                 {
                     device_key = entry.DeviceKey,
@@ -188,35 +300,42 @@ internal sealed class BatteryHistoryStore
             return;
 
         _lastByDevice.Clear();
+        _soraHistoryRelationsByPath.Clear();
         foreach (var entry in ReadEntries(DateTime.MinValue))
         {
-            if (!_lastByDevice.TryGetValue(entry.DeviceKey, out var previous) || entry.TimestampUtc > previous.TimestampUtc)
+            if (entry.HasBatteryPercentage
+                && (!_lastByDevice.TryGetValue(entry.DeviceKey, out var previous) || entry.TimestampUtc > previous.TimestampUtc))
                 _lastByDevice[entry.DeviceKey] = entry;
+            RememberSoraHistoryAnchor(entry);
         }
         _lastCacheLoaded = true;
     }
 
-    private void MigrateLegacyEntries(BatteryHistoryEntry current)
+    private void MigrateLegacyEntries(BatteryHistoryEntry current, IReadOnlyCollection<string> legacyAliasKeys)
     {
-        if (!_legacyMigrationChecked.Add(current.DeviceKey) || !File.Exists(_paths.HistoryPath))
+        if (!File.Exists(_paths.HistoryPath))
             return;
 
-        var legacyKey = $"{current.VendorId}:{current.ProductId}:{NormalizeForKey(current.DeviceName)}";
-        if (string.Equals(legacyKey, current.DeviceKey, StringComparison.OrdinalIgnoreCase))
+        var legacyKeys = new HashSet<string>(legacyAliasKeys, StringComparer.OrdinalIgnoreCase)
+        {
+            $"{current.VendorId}:{current.ProductId}:{NormalizeForKey(current.DeviceName)}"
+        };
+        legacyKeys.Remove(current.DeviceKey);
+        legacyKeys.RemoveWhere(key => !_lastByDevice.ContainsKey(key));
+        if (legacyKeys.Count == 0)
             return;
 
         var entries = ReadEntries(DateTime.MinValue).ToArray();
-        var changed = false;
+        var migratedCount = 0;
         foreach (var entry in entries)
         {
-            if (!string.Equals(entry.DeviceKey, legacyKey, StringComparison.OrdinalIgnoreCase))
+            if (!legacyKeys.Contains(entry.DeviceKey))
                 continue;
             entry.DeviceKey = current.DeviceKey;
-            entry.DeviceSerial = current.DeviceSerial;
-            changed = true;
+            migratedCount++;
         }
 
-        if (!changed)
+        if (migratedCount == 0)
             return;
 
         var temporaryPath = _paths.HistoryPath + ".migrate.tmp";
@@ -226,7 +345,444 @@ internal sealed class BatteryHistoryStore
         _log?.Write("info", "history.migrated", nameof(BatteryHistoryStore), "success", new
         {
             device_key = current.DeviceKey,
-            migrated_entry_count = entries.Count(entry => string.Equals(entry.DeviceKey, current.DeviceKey, StringComparison.OrdinalIgnoreCase))
+            migrated_entry_count = migratedCount,
+            legacy_alias_count = legacyKeys.Count
+        });
+    }
+
+    private void AdoptKnownSoraReceiverHistoryKey(BatteryHistoryEntry current)
+    {
+        var receiverLogical = current.LogicalDeviceId.StartsWith(SoraReceiverLogicalPrefix, StringComparison.OrdinalIgnoreCase);
+        var wiredLogical = current.LogicalDeviceId.StartsWith(SoraWiredLogicalPrefix, StringComparison.OrdinalIgnoreCase);
+        if ((!receiverLogical && !wiredLogical) || current.ResolvedDeviceIds.Count == 0)
+            return;
+
+        if (wiredLogical
+            && !string.Equals(
+                current.HistoryAnchorEvidence,
+                HistoryAnchorEvidence.RecoverPersistedReceiver.ToString(),
+                StringComparison.OrdinalIgnoreCase))
+            return;
+
+        if (receiverLogical && IsSoraReceiverSerialDeviceKey(current.DeviceKey))
+            return;
+
+        var persistedCandidates = current.ResolvedDeviceIds
+            .SelectMany(SoraHistoryAnchorsForPath)
+            .Distinct()
+            .ToArray();
+        var latestFactsByAssociation = persistedCandidates
+            .GroupBy(
+                anchor => anchor.ReceiverAssociationKey,
+                StringComparer.OrdinalIgnoreCase)
+            .Select(group => group
+                .OrderByDescending(anchor => anchor.TimestampUtc)
+                .First())
+            .ToArray();
+        var knownCandidates = latestFactsByAssociation
+            .Where(anchor => !anchor.IsRejected)
+            .Where(anchor => !string.IsNullOrWhiteSpace(anchor.CanonicalHistoryDeviceKey))
+            .ToArray();
+        var known = (receiverLogical
+                ? knownCandidates.Where(anchor => IsSoraReceiverSerialDeviceKey(anchor.CanonicalHistoryDeviceKey))
+                : knownCandidates)
+            .OrderByDescending(anchor => anchor.TimestampUtc)
+            .FirstOrDefault();
+        if (wiredLogical && known == null && latestFactsByAssociation.Any(anchor => anchor.IsRejected))
+        {
+            _log?.Write("info", "history.identity_recovery_blocked", nameof(BatteryHistoryStore), "success", new
+            {
+                provisional_device_key = current.DeviceKey,
+                reason = "scoped_receiver_pairing_mismatch",
+                rejected_relation_count = latestFactsByAssociation.Count(anchor => anchor.IsRejected),
+                resolved_device_ids = current.ResolvedDeviceIds
+            });
+        }
+        if (known == null
+            || (string.Equals(known.CanonicalHistoryDeviceKey, current.DeviceKey, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(known.ReceiverAssociationKey, current.AssociationReceiverHistoryKey, StringComparison.OrdinalIgnoreCase)))
+            return;
+
+        var provisionalKey = current.DeviceKey;
+        current.DeviceKey = known.CanonicalHistoryDeviceKey;
+        current.AssociationReceiverHistoryKey = known.ReceiverAssociationKey;
+        current.AssociationReceiverSerial = known.ReceiverSerial;
+        current.ReceiverCanonicalHistoryKey = known.CanonicalHistoryDeviceKey;
+        _log?.Write("info", "history.identity_reused", nameof(BatteryHistoryStore), "success", new
+        {
+            provisional_device_key = provisionalKey,
+            device_key = current.DeviceKey,
+            reason = "persisted_resolved_endpoint_overlap",
+            resolved_device_ids = current.ResolvedDeviceIds
+        });
+    }
+
+    private void RememberSoraHistoryAnchor(BatteryHistoryEntry entry)
+    {
+        RememberSoraHistoryAnchorIn(_soraHistoryRelationsByPath, entry);
+    }
+
+    private static void RememberSoraHistoryAnchorIn(
+        Dictionary<string, List<SoraHistoryAnchor>> relationsByPath,
+        BatteryHistoryEntry entry)
+    {
+        var rejected = string.Equals(
+            entry.HistoryAnchorEvidence,
+            HistoryAnchorEvidence.RejectPersistedReceiver.ToString(),
+            StringComparison.OrdinalIgnoreCase);
+        if (!rejected && string.Equals(entry.State, "device_offline", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var receiverAssociationKey = ReceiverAssociationKey(entry);
+        if (string.IsNullOrWhiteSpace(receiverAssociationKey)
+            || (!rejected && !IsSoraReceiverDeviceKey(entry.DeviceKey)))
+            return;
+
+        foreach (var deviceId in entry.ResolvedDeviceIds.Where(value => !string.IsNullOrWhiteSpace(value)))
+        {
+            if (!relationsByPath.TryGetValue(deviceId, out var relations))
+            {
+                relations = new List<SoraHistoryAnchor>();
+                relationsByPath[deviceId] = relations;
+            }
+            var previous = FindReceiverAnchor(
+                relations,
+                receiverAssociationKey,
+                entry.AssociationReceiverSerial);
+            if (previous != null && previous.TimestampUtc > entry.TimestampUtc)
+                continue;
+            if (previous != null)
+                relations.Remove(previous);
+            var recordedCanonicalHistoryDeviceKey = !string.IsNullOrWhiteSpace(entry.ReceiverCanonicalHistoryKey)
+                ? entry.ReceiverCanonicalHistoryKey
+                : !rejected && IsSoraReceiverDeviceKey(entry.DeviceKey)
+                    ? entry.DeviceKey
+                    : "";
+            var canonicalHistoryDeviceKey = rejected
+                ? previous?.CanonicalHistoryDeviceKey ?? recordedCanonicalHistoryDeviceKey
+                : PreferCanonicalReceiverHistoryKey(
+                    previous?.CanonicalHistoryDeviceKey,
+                    recordedCanonicalHistoryDeviceKey);
+            var receiverSerial = DeviceIdentity.NormalizeSerial(entry.AssociationReceiverSerial)
+                ?? previous?.ReceiverSerial
+                ?? "";
+            relations.Add(new SoraHistoryAnchor(
+                receiverAssociationKey,
+                receiverSerial,
+                canonicalHistoryDeviceKey,
+                entry.TimestampUtc,
+                entry.DeviceSerial,
+                rejected,
+                entry));
+        }
+    }
+
+    private bool IdentityEvidenceAlreadyCurrent(BatteryHistoryEntry entry)
+    {
+        var rejected = string.Equals(
+            entry.HistoryAnchorEvidence,
+            HistoryAnchorEvidence.RejectPersistedReceiver.ToString(),
+            StringComparison.OrdinalIgnoreCase);
+        var paths = entry.ResolvedDeviceIds
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (paths.Length == 0)
+            return true;
+
+        var receiverAssociationKey = ReceiverAssociationKey(entry);
+        if (string.IsNullOrWhiteSpace(receiverAssociationKey))
+            return false;
+
+        return paths.All(path =>
+        {
+            if (!_soraHistoryRelationsByPath.TryGetValue(path, out var relations))
+                return false;
+            var current = FindReceiverAnchor(
+                relations,
+                receiverAssociationKey,
+                entry.AssociationReceiverSerial);
+            var latestForAssociation = LatestFactForAssociation(relations, receiverAssociationKey);
+            var latestActiveRelation = relations
+                .GroupBy(
+                    anchor => anchor.ReceiverAssociationKey,
+                    StringComparer.OrdinalIgnoreCase)
+                .Select(group => group
+                    .OrderByDescending(anchor => anchor.TimestampUtc)
+                    .First())
+                .Where(anchor => !anchor.IsRejected)
+                .Where(anchor => !string.IsNullOrWhiteSpace(anchor.CanonicalHistoryDeviceKey))
+                .OrderByDescending(anchor => anchor.TimestampUtc)
+                .FirstOrDefault();
+            return current != null
+                && ReferenceEquals(current, latestForAssociation)
+                && (rejected || ReferenceEquals(current, latestActiveRelation))
+                && current.IsRejected == rejected
+                && (rejected
+                    || string.Equals(
+                        current.CanonicalHistoryDeviceKey,
+                        entry.ReceiverCanonicalHistoryKey,
+                        StringComparison.OrdinalIgnoreCase));
+        });
+    }
+
+    private bool RestoresRejectedSoraAnchor(BatteryHistoryEntry entry)
+    {
+        if (!IsSoraReceiverDeviceKey(entry.DeviceKey))
+            return false;
+
+        var receiverAssociationKey = ReceiverAssociationKey(entry);
+        if (string.IsNullOrWhiteSpace(receiverAssociationKey))
+            return false;
+
+        return entry.ResolvedDeviceIds
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(path => FindReceiverAnchor(
+                SoraHistoryAnchorsForPath(path),
+                receiverAssociationKey,
+                entry.AssociationReceiverSerial))
+            .Any(anchor => anchor?.IsRejected == true);
+    }
+
+    private IEnumerable<SoraHistoryAnchor> SoraHistoryAnchorsForPath(string path)
+    {
+        return _soraHistoryRelationsByPath.TryGetValue(path, out var relations)
+            ? relations
+            : Array.Empty<SoraHistoryAnchor>();
+    }
+
+    private static SoraHistoryAnchor? FindReceiverAnchor(
+        IEnumerable<SoraHistoryAnchor> anchors,
+        string receiverAssociationKey,
+        string? receiverSerial)
+    {
+        var sameAssociation = anchors
+            .Where(anchor => string.Equals(
+                anchor.ReceiverAssociationKey,
+                receiverAssociationKey,
+                StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        var normalizedReceiverSerial = DeviceIdentity.NormalizeSerial(receiverSerial);
+        if (normalizedReceiverSerial == null)
+            return sameAssociation
+                .OrderByDescending(anchor => anchor.TimestampUtc)
+                .FirstOrDefault();
+
+        return sameAssociation
+                .Where(anchor => string.Equals(
+                    DeviceIdentity.NormalizeSerial(anchor.ReceiverSerial),
+                    normalizedReceiverSerial,
+                    StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(anchor => anchor.TimestampUtc)
+                .FirstOrDefault()
+            ?? sameAssociation
+                .Where(anchor => DeviceIdentity.NormalizeSerial(anchor.ReceiverSerial) == null)
+                .OrderByDescending(anchor => anchor.TimestampUtc)
+                .FirstOrDefault();
+    }
+
+    private static SoraHistoryAnchor? LatestFactForAssociation(
+        IEnumerable<SoraHistoryAnchor> anchors,
+        string receiverAssociationKey)
+    {
+        return anchors
+            .Where(anchor => string.Equals(
+                anchor.ReceiverAssociationKey,
+                receiverAssociationKey,
+                StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(anchor => anchor.TimestampUtc)
+            .FirstOrDefault();
+    }
+
+    private static string ReceiverAssociationKey(BatteryHistoryEntry entry)
+    {
+        if (!string.IsNullOrWhiteSpace(entry.AssociationReceiverHistoryKey))
+            return entry.AssociationReceiverHistoryKey;
+        if (!IsSoraReceiverDeviceKey(entry.DeviceKey))
+            return "";
+
+        var receiverPath = entry.ResolvedDeviceIds.FirstOrDefault(deviceId =>
+            IsSoraReceiverProductId(ProductIdFromHidPath(deviceId)));
+        if (string.IsNullOrWhiteSpace(receiverPath)
+            && entry.LogicalDeviceId.StartsWith(SoraReceiverLogicalPrefix, StringComparison.OrdinalIgnoreCase))
+            receiverPath = entry.LogicalDeviceId[SoraReceiverLogicalPrefix.Length..];
+        if (string.IsNullOrWhiteSpace(receiverPath))
+            return entry.DeviceKey;
+
+        var receiverProductId = ProductIdFromHidPath(receiverPath);
+        if (!IsSoraReceiverProductId(receiverProductId))
+            receiverProductId = "0XAE1C";
+        return $"{NormalizeId(entry.VendorId)}:{receiverProductId}:PATH:{ShortHash(receiverPath)}";
+    }
+
+    private static string PreferCanonicalReceiverHistoryKey(string? previous, string current)
+    {
+        if (string.IsNullOrWhiteSpace(previous))
+            return current;
+        if (IsSoraReceiverSerialDeviceKey(current))
+            return current;
+        return previous;
+    }
+
+    private static IReadOnlyList<string> IdentityEvidencePaths(DeviceIdentityObservation observation)
+    {
+        if (observation.HistoryAnchorEvidence != HistoryAnchorEvidence.RejectPersistedReceiver)
+            return observation.ResolvedDeviceIds;
+
+        if (!string.IsNullOrWhiteSpace(observation.DeviceId))
+            return new[] { observation.DeviceId };
+
+        return observation.ResolvedDeviceIds;
+    }
+
+    private void PrepareReceiverCanonicalIdentity(BatteryHistoryEntry entry)
+    {
+        var receiverLogical = entry.LogicalDeviceId.StartsWith(
+            SoraReceiverLogicalPrefix,
+            StringComparison.OrdinalIgnoreCase);
+        if (receiverLogical && string.IsNullOrWhiteSpace(entry.AssociationReceiverHistoryKey))
+            entry.AssociationReceiverHistoryKey = ReceiverAssociationKey(entry);
+        if (receiverLogical
+            && string.Equals(
+                entry.ConnectionTransport,
+                DeviceConnectionTransport.Receiver.ToString(),
+                StringComparison.OrdinalIgnoreCase)
+            && string.IsNullOrWhiteSpace(entry.AssociationReceiverSerial))
+            entry.AssociationReceiverSerial = DeviceIdentity.NormalizeSerial(entry.DeviceSerial) ?? "";
+        if (string.IsNullOrWhiteSpace(entry.ReceiverCanonicalHistoryKey)
+            && IsSoraReceiverDeviceKey(entry.DeviceKey))
+            entry.ReceiverCanonicalHistoryKey = entry.DeviceKey;
+
+        var previousCanonicalKeys = ReceiverCanonicalHistoryKeys(entry);
+        CompleteReceiverCanonicalHistoryKey(entry);
+        if (!string.Equals(
+                entry.HistoryAnchorEvidence,
+                HistoryAnchorEvidence.RejectPersistedReceiver.ToString(),
+                StringComparison.OrdinalIgnoreCase)
+            && IsSoraReceiverSerialDeviceKey(entry.ReceiverCanonicalHistoryKey)
+            && previousCanonicalKeys.Any(key => !string.Equals(
+                key,
+                entry.ReceiverCanonicalHistoryKey,
+                StringComparison.OrdinalIgnoreCase)))
+        {
+            PromoteReceiverHistoryKey(
+                ReceiverAssociationKey(entry),
+                entry.AssociationReceiverSerial,
+                entry.ReceiverCanonicalHistoryKey,
+                previousCanonicalKeys);
+            EnsureLastCacheLoaded();
+            CompleteReceiverCanonicalHistoryKey(entry);
+        }
+    }
+
+    private void CompleteReceiverCanonicalHistoryKey(BatteryHistoryEntry entry)
+    {
+        var receiverAssociationKey = ReceiverAssociationKey(entry);
+        if (string.IsNullOrWhiteSpace(receiverAssociationKey))
+            return;
+
+        var previousCanonical = entry.ResolvedDeviceIds
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(path => FindReceiverAnchor(
+                SoraHistoryAnchorsForPath(path),
+                receiverAssociationKey,
+                entry.AssociationReceiverSerial))
+            .Where(anchor => anchor != null)
+            .Cast<SoraHistoryAnchor>()
+            .Select(anchor => anchor.CanonicalHistoryDeviceKey)
+            .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
+        var recordedCanonical = !string.IsNullOrWhiteSpace(entry.ReceiverCanonicalHistoryKey)
+            ? entry.ReceiverCanonicalHistoryKey
+            : !string.Equals(
+                entry.HistoryAnchorEvidence,
+                HistoryAnchorEvidence.RejectPersistedReceiver.ToString(),
+                StringComparison.OrdinalIgnoreCase)
+                && IsSoraReceiverDeviceKey(entry.DeviceKey)
+                    ? entry.DeviceKey
+                    : "";
+        entry.ReceiverCanonicalHistoryKey = PreferCanonicalReceiverHistoryKey(
+            previousCanonical,
+            recordedCanonical);
+    }
+
+    private IReadOnlyCollection<string> ReceiverCanonicalHistoryKeys(BatteryHistoryEntry entry)
+    {
+        var receiverAssociationKey = ReceiverAssociationKey(entry);
+        if (string.IsNullOrWhiteSpace(receiverAssociationKey))
+            return Array.Empty<string>();
+
+        return entry.ResolvedDeviceIds
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(path => FindReceiverAnchor(
+                SoraHistoryAnchorsForPath(path),
+                receiverAssociationKey,
+                entry.AssociationReceiverSerial))
+            .Where(anchor => anchor != null)
+            .Cast<SoraHistoryAnchor>()
+            .Select(anchor => anchor.CanonicalHistoryDeviceKey)
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private void PromoteReceiverHistoryKey(
+        string receiverAssociationKey,
+        string receiverSerial,
+        string canonicalHistoryDeviceKey,
+        IReadOnlyCollection<string> previousCanonicalKeys)
+    {
+        if (string.IsNullOrWhiteSpace(receiverAssociationKey)
+            || string.IsNullOrWhiteSpace(canonicalHistoryDeviceKey)
+            || previousCanonicalKeys.Count == 0
+            || !File.Exists(_paths.HistoryPath))
+            return;
+
+        var previousKeys = new HashSet<string>(previousCanonicalKeys, StringComparer.OrdinalIgnoreCase);
+        previousKeys.Remove(canonicalHistoryDeviceKey);
+        if (previousKeys.Count == 0)
+            return;
+
+        var entries = ReadEntries(DateTime.MinValue).ToArray();
+        var migratedCount = 0;
+        foreach (var historicalEntry in entries)
+        {
+            var changed = false;
+            if (previousKeys.Contains(historicalEntry.DeviceKey))
+            {
+                historicalEntry.DeviceKey = canonicalHistoryDeviceKey;
+                changed = true;
+            }
+            if (string.Equals(
+                    ReceiverAssociationKey(historicalEntry),
+                    receiverAssociationKey,
+                    StringComparison.OrdinalIgnoreCase)
+                && SerialsCanRepresentSameDevice(
+                    historicalEntry.AssociationReceiverSerial,
+                    receiverSerial)
+                && (string.IsNullOrWhiteSpace(historicalEntry.ReceiverCanonicalHistoryKey)
+                    || previousKeys.Contains(historicalEntry.ReceiverCanonicalHistoryKey)))
+            {
+                historicalEntry.AssociationReceiverHistoryKey = receiverAssociationKey;
+                historicalEntry.AssociationReceiverSerial = DeviceIdentity.NormalizeSerial(receiverSerial) ?? "";
+                historicalEntry.ReceiverCanonicalHistoryKey = canonicalHistoryDeviceKey;
+                changed = true;
+            }
+            if (changed)
+                migratedCount++;
+        }
+        if (migratedCount == 0)
+            return;
+
+        var temporaryPath = _paths.HistoryPath + ".identity-promote.tmp";
+        File.WriteAllLines(temporaryPath, entries.Select(item => JsonSerializer.Serialize(item, JsonOptions)));
+        File.Move(temporaryPath, _paths.HistoryPath, overwrite: true);
+        _lastCacheLoaded = false;
+        _log?.Write("info", "history.receiver_key_promoted", nameof(BatteryHistoryStore), "success", new
+        {
+            receiver_association_key = receiverAssociationKey,
+            canonical_history_device_key = canonicalHistoryDeviceKey,
+            previous_history_device_keys = previousKeys,
+            migrated_entry_count = migratedCount
         });
     }
 
@@ -242,6 +798,14 @@ internal sealed class BatteryHistoryStore
             return "charging_start";
         if (previous.IsCharging && !current.IsCharging)
             return "charging_end";
+        if (!string.Equals(previous.LogicalDeviceId, current.LogicalDeviceId, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(previous.ConnectionTransport, current.ConnectionTransport, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(previous.HistoryAnchorEvidence, current.HistoryAnchorEvidence, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(previous.AssociationReceiverHistoryKey, current.AssociationReceiverHistoryKey, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(previous.ReceiverCanonicalHistoryKey, current.ReceiverCanonicalHistoryKey, StringComparison.OrdinalIgnoreCase)
+            || !new HashSet<string>(previous.ResolvedDeviceIds, StringComparer.OrdinalIgnoreCase)
+                .SetEquals(current.ResolvedDeviceIds))
+            return "transport_change";
         if (previous.BatteryPercentage != current.BatteryPercentage)
             return "sample";
         if (current.TimestampUtc - previous.TimestampUtc >= TimeSpan.FromHours(1))
@@ -284,7 +848,7 @@ internal sealed class BatteryHistoryStore
     {
         return !string.IsNullOrWhiteSpace(entry.DeviceKey)
             && !string.IsNullOrWhiteSpace(entry.DeviceName)
-            && entry.BatteryPercentage is >= 1 and <= 100;
+            && (!entry.HasBatteryPercentage || entry.BatteryPercentage is >= 1 and <= 100);
     }
 
     private void PruneOldEntriesIfDue()
@@ -301,7 +865,22 @@ internal sealed class BatteryHistoryStore
             }
 
             var cutoff = DateTime.UtcNow.AddDays(-30);
-            var kept = ReadEntries(cutoff)
+            var allEntries = ReadEntries(DateTime.MinValue).ToArray();
+            var keptEntries = allEntries
+                .Where(entry => entry.TimestampUtc >= cutoff)
+                .ToList();
+            var latestRelations = new Dictionary<string, List<SoraHistoryAnchor>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var entry in allEntries)
+                RememberSoraHistoryAnchorIn(latestRelations, entry);
+            foreach (var entry in keptEntries)
+                MaterializeReceiverIdentityFromLatestRelation(entry, latestRelations);
+            var retainedIdentityEntries = latestRelations
+                .SelectMany(path => path.Value.Select(anchor => new { Path = path.Key, Anchor = anchor }))
+                .Where(item => item.Anchor.SourceEntry.TimestampUtc < cutoff)
+                .Select(item => CreateRetainedIdentityEntry(item.Path, item.Anchor))
+                .ToArray();
+            keptEntries.AddRange(retainedIdentityEntries);
+            var kept = keptEntries
                 .Select(entry => JsonSerializer.Serialize(entry, JsonOptions))
                 .ToArray();
             var temporaryPath = _paths.HistoryPath + ".tmp";
@@ -312,7 +891,8 @@ internal sealed class BatteryHistoryStore
             _log?.Write("info", "history.pruned", nameof(BatteryHistoryStore), "success", new
             {
                 cutoff_utc = cutoff,
-                kept_count = kept.Length
+                kept_count = kept.Length,
+                retained_identity_count = retainedIdentityEntries.Length
             });
         }
         catch (Exception ex)
@@ -321,8 +901,74 @@ internal sealed class BatteryHistoryStore
         }
     }
 
-    private static string CreateDeviceKey(BatteryReading reading)
+    private static BatteryHistoryEntry CreateRetainedIdentityEntry(string deviceId, SoraHistoryAnchor anchor)
     {
+        var source = anchor.SourceEntry;
+        return new BatteryHistoryEntry
+        {
+            TimestampUtc = source.TimestampUtc,
+            DeviceKey = anchor.IsRejected ? source.DeviceKey : anchor.CanonicalHistoryDeviceKey,
+            DeviceName = source.DeviceName,
+            LogicalDeviceId = source.LogicalDeviceId,
+            AssociationReceiverHistoryKey = anchor.ReceiverAssociationKey,
+            AssociationReceiverSerial = anchor.ReceiverSerial,
+            ReceiverCanonicalHistoryKey = anchor.CanonicalHistoryDeviceKey,
+            ConnectionTransport = source.ConnectionTransport,
+            HistoryAnchorEvidence = anchor.IsRejected
+                ? HistoryAnchorEvidence.RejectPersistedReceiver.ToString()
+                : HistoryAnchorEvidence.ConfirmReceiver.ToString(),
+            ResolvedDeviceIds = new[] { deviceId },
+            DeviceSerial = source.DeviceSerial,
+            VendorId = source.VendorId,
+            ProductId = source.ProductId,
+            HasBatteryPercentage = false,
+            State = anchor.IsRejected ? "identity_anchor_rejected" : "identity_anchor_retained",
+            Source = source.Source
+        };
+    }
+
+    private static void MaterializeReceiverIdentityFromLatestRelation(
+        BatteryHistoryEntry entry,
+        IReadOnlyDictionary<string, List<SoraHistoryAnchor>> latestRelations)
+    {
+        var sourceAnchor = latestRelations.Values
+            .SelectMany(anchors => anchors)
+            .Where(anchor => ReferenceEquals(anchor.SourceEntry, entry))
+            .OrderByDescending(anchor => anchor.TimestampUtc)
+            .FirstOrDefault();
+        if (sourceAnchor == null)
+            return;
+
+        entry.AssociationReceiverHistoryKey = sourceAnchor.ReceiverAssociationKey;
+        entry.AssociationReceiverSerial = sourceAnchor.ReceiverSerial;
+        entry.ReceiverCanonicalHistoryKey = sourceAnchor.CanonicalHistoryDeviceKey;
+    }
+
+    internal static string CreateDeviceKey(BatteryReading reading)
+    {
+        if (!string.IsNullOrWhiteSpace(reading.HistoryDeviceKey))
+            return reading.HistoryDeviceKey.Trim();
+
+        if (!string.IsNullOrWhiteSpace(reading.LogicalDeviceId))
+        {
+            var logicalDeviceId = reading.LogicalDeviceId.Trim();
+            if (logicalDeviceId.StartsWith(SoraReceiverLogicalPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                var receiverAnchor = logicalDeviceId[SoraReceiverLogicalPrefix.Length..];
+                var logicalVendorId = NormalizeId(reading.VendorId);
+                if (!string.IsNullOrWhiteSpace(receiverAnchor))
+                {
+                    var receiverProductId = ProductIdFromHidPath(receiverAnchor);
+                    if (!IsSoraReceiverProductId(receiverProductId))
+                        receiverProductId = "0XAE1C";
+                    return $"{logicalVendorId}:{receiverProductId}:PATH:{ShortHash(receiverAnchor)}";
+                }
+            }
+
+            if (!logicalDeviceId.StartsWith(SoraWiredLogicalPrefix, StringComparison.OrdinalIgnoreCase))
+                return $"LOGICAL:{ShortHash(logicalDeviceId)}";
+        }
+
         var vendorId = NormalizeId(reading.VendorId);
         var productId = NormalizeId(reading.ProductId);
         var name = DisplayDeviceName(reading);
@@ -340,6 +986,106 @@ internal sealed class BatteryHistoryStore
         return NormalizeForKey($"{reading.Source}:{name}");
     }
 
+    internal static bool IsSoraReceiverDeviceKey(string? deviceKey)
+    {
+        return !string.IsNullOrWhiteSpace(deviceKey)
+            && (deviceKey.StartsWith("0X1915:0XAE1C:", StringComparison.OrdinalIgnoreCase)
+                || deviceKey.StartsWith("0X1915:0XAE8A:", StringComparison.OrdinalIgnoreCase)
+                || deviceKey.StartsWith("0X1915:0XAE8C:", StringComparison.OrdinalIgnoreCase));
+    }
+
+    internal static bool IsSoraReceiverSerialDeviceKey(string? deviceKey)
+    {
+        return IsSoraReceiverDeviceKey(deviceKey)
+            && deviceKey!.Contains(":SERIAL:", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static IReadOnlyCollection<string> CreateLegacyAliasKeys(BatteryReading reading)
+    {
+        var aliases = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(reading.LogicalDeviceId))
+            return aliases;
+
+        var logicalDeviceId = reading.LogicalDeviceId.Trim();
+        var isReceiverLogical = logicalDeviceId.StartsWith(SoraReceiverLogicalPrefix, StringComparison.OrdinalIgnoreCase);
+        var isWiredLogical = logicalDeviceId.StartsWith(SoraWiredLogicalPrefix, StringComparison.OrdinalIgnoreCase);
+        if (!isReceiverLogical && !isWiredLogical)
+            return aliases;
+
+        aliases.Add($"LOGICAL:{ShortHash(logicalDeviceId)}");
+
+        var vendorId = NormalizeId(reading.VendorId);
+        var productIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (isReceiverLogical)
+        {
+            var receiverAnchor = logicalDeviceId[SoraReceiverLogicalPrefix.Length..];
+            var receiverProductId = ProductIdFromHidPath(receiverAnchor);
+            productIds.Add(IsSoraReceiverProductId(receiverProductId) ? receiverProductId : "0XAE1C");
+        }
+        if (!string.IsNullOrWhiteSpace(reading.ProductId))
+            productIds.Add(NormalizeId(reading.ProductId));
+
+        foreach (var deviceId in DeviceIdentity.ResolvedDeviceIds(reading))
+        {
+            var pathProductId = ProductIdFromHidPath(deviceId);
+            if (!string.IsNullOrWhiteSpace(pathProductId))
+                productIds.Add(pathProductId);
+            if (!string.IsNullOrWhiteSpace(pathProductId))
+            {
+                aliases.Add($"{vendorId}:{pathProductId}:PATH:{ShortHash(deviceId)}");
+                if (!IsSoraReceiverProductId(pathProductId))
+                    aliases.Add($"LOGICAL:{ShortHash(SoraWiredLogicalPrefix + deviceId)}");
+            }
+        }
+
+        var serial = DeviceIdentity.NormalizeSerial(reading.DeviceSerial);
+        if (serial != null)
+        {
+            foreach (var productId in productIds)
+                aliases.Add($"{vendorId}:{productId}:SERIAL:{serial}");
+        }
+
+        var name = NormalizeForKey(DisplayDeviceName(reading));
+        foreach (var productId in productIds)
+            aliases.Add($"{vendorId}:{productId}:{name}");
+
+        return aliases;
+    }
+
+    private static bool IsSoraReceiverProductId(string? productId)
+    {
+        return productId is not null
+            && (productId.Equals("0XAE1C", StringComparison.OrdinalIgnoreCase)
+                || productId.Equals("0XAE8A", StringComparison.OrdinalIgnoreCase)
+                || productId.Equals("0XAE8C", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool SerialsCanRepresentSameDevice(string? previous, string? current)
+    {
+        var previousSerial = DeviceIdentity.NormalizeSerial(previous);
+        var currentSerial = DeviceIdentity.NormalizeSerial(current);
+        return previousSerial == null
+            || currentSerial == null
+            || string.Equals(previousSerial, currentSerial, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string ProductIdFromHidPath(string deviceId)
+    {
+        const string marker = "pid_";
+        var markerIndex = deviceId.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (markerIndex < 0 || deviceId.Length < markerIndex + marker.Length + 4)
+            return "";
+
+        var value = deviceId.Substring(markerIndex + marker.Length, 4);
+        return int.TryParse(
+            value,
+            System.Globalization.NumberStyles.HexNumber,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out var productId)
+                ? $"0X{productId:X4}"
+                : "";
+    }
+
     private static string DisplayDeviceName(BatteryReading reading)
     {
         var name = string.IsNullOrWhiteSpace(reading.DeviceName) ? reading.Source : reading.DeviceName;
@@ -353,6 +1099,42 @@ internal sealed class BatteryHistoryStore
     private static string NormalizeId(string value)
     {
         return string.IsNullOrWhiteSpace(value) ? "" : value.Trim().ToUpperInvariant();
+    }
+
+    private static int ParseProductId(string value)
+    {
+        var normalized = value.Trim();
+        if (normalized.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            normalized = normalized[2..];
+        return int.TryParse(
+            normalized,
+            System.Globalization.NumberStyles.HexNumber,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out var productId)
+                ? productId
+                : 0;
+    }
+
+    private static BatteryReading IdentityObservationForLog(DeviceIdentityObservation observation)
+    {
+        return new BatteryReading
+        {
+            HasBatteryPercentage = false,
+            LogicalDeviceId = observation.LogicalDeviceId,
+            HistoryDeviceKey = observation.HistoryDeviceKey,
+            AssociationReceiverHistoryKey = observation.AssociationReceiverHistoryKey,
+            AssociationReceiverSerial = observation.AssociationReceiverSerial,
+            ConnectionTransport = NinjutsoSoraTransportPolicy.GetTransport(ParseProductId(observation.ProductId)),
+            HistoryAnchorEvidence = observation.HistoryAnchorEvidence,
+            ResolvedDeviceIds = observation.ResolvedDeviceIds,
+            DeviceName = observation.DeviceName,
+            DeviceId = observation.DeviceId,
+            DeviceSerial = observation.DeviceSerial,
+            VendorId = observation.VendorId,
+            ProductId = observation.ProductId,
+            Source = observation.Source,
+            TimestampUtc = observation.TimestampUtc
+        };
     }
 
     private static string ShortHash(string value)
@@ -370,6 +1152,15 @@ internal sealed class BatteryHistoryStore
     {
         return value.Length <= maxLength ? value : value[..maxLength].TrimEnd();
     }
+
+    private sealed record SoraHistoryAnchor(
+        string ReceiverAssociationKey,
+        string ReceiverSerial,
+        string CanonicalHistoryDeviceKey,
+        DateTime TimestampUtc,
+        string DeviceSerial,
+        bool IsRejected,
+        BatteryHistoryEntry SourceEntry);
 }
 
 internal sealed class BatteryHistoryWindow : Form

@@ -15,6 +15,20 @@ internal static class DeviceIdentity
 
     public static string CreateRuntimeKey(BatteryReading reading)
     {
+        if (!string.IsNullOrWhiteSpace(reading.LogicalDeviceId))
+        {
+            var logicalDeviceId = reading.LogicalDeviceId.Trim();
+            var receiverEpochSerial = NormalizeSerial(reading.AssociationReceiverSerial)
+                ?? (logicalDeviceId.StartsWith(
+                        "ninjutso-sora-v2:receiver:",
+                        StringComparison.OrdinalIgnoreCase)
+                    ? NormalizeSerial(reading.DeviceSerial)
+                    : null);
+            return receiverEpochSerial == null
+                ? $"LOGICAL:{logicalDeviceId}"
+                : $"LOGICAL:{logicalDeviceId}:RECEIVER-SERIAL:{receiverEpochSerial}";
+        }
+
         var serial = NormalizeSerial(reading.DeviceSerial);
         if (serial != null)
             return $"{reading.VendorId}:{reading.ProductId}:SERIAL:{serial}";
@@ -33,6 +47,15 @@ internal static class DeviceIdentity
 
         var unmatchedPrevious = Enumerable.Range(0, previousReadings.Count).ToList();
         var unmatchedCurrent = Enumerable.Range(0, currentReadings.Count).ToList();
+
+        MatchDistinct(
+            unmatchedPrevious,
+            unmatchedCurrent,
+            previousReadings,
+            currentReadings,
+            static (previous, current) => !string.IsNullOrWhiteSpace(previous.LogicalDeviceId)
+                && !string.IsNullOrWhiteSpace(current.LogicalDeviceId)
+                && string.Equals(previous.LogicalDeviceId.Trim(), current.LogicalDeviceId.Trim(), StringComparison.OrdinalIgnoreCase));
 
         MatchDistinct(
             unmatchedPrevious,
@@ -65,6 +88,7 @@ internal static class DeviceIdentity
             static (previous, current) => NormalizeSerial(previous.DeviceSerial) == null
                 && NormalizeSerial(current.DeviceSerial) == null
                 && SameProviderFamily(previous, current)
+                && string.Equals(previous.ProductId, current.ProductId, StringComparison.OrdinalIgnoreCase)
                 && !string.IsNullOrWhiteSpace(previous.DeviceName)
                 && string.Equals(previous.DeviceName.Trim(), current.DeviceName.Trim(), StringComparison.OrdinalIgnoreCase));
 
@@ -82,10 +106,19 @@ internal static class DeviceIdentity
 
         var returnedPaths = providerResults
             .SelectMany(result => result.Readings)
-            .Select(reading => reading.DeviceId)
+            .SelectMany(ResolvedDeviceIds)
             .Where(path => !string.IsNullOrWhiteSpace(path))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         return candidatePaths.IsSubsetOf(returnedPaths);
+    }
+
+    public static IReadOnlyList<string> ResolvedDeviceIds(BatteryReading reading)
+    {
+        return reading.ResolvedDeviceIds
+            .Append(reading.DeviceId)
+            .Where(deviceId => !string.IsNullOrWhiteSpace(deviceId))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
     }
 
     private static void MatchDistinct(

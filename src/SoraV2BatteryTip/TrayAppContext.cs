@@ -92,7 +92,12 @@ internal sealed class TrayAppContext : ApplicationContext
         _draftImporter = new ProfileDraftImporter(_paths, _profileProvider);
         _providerManager = new BatteryProviderManager(
             _hidInventory,
-            new IBatteryProvider[] { new NinjutsoSoraOfficialProvider(_log), new CompxBatteryProvider(_log), _profileProvider },
+            new IBatteryProvider[]
+            {
+                new NinjutsoSoraOfficialProvider(_log, ApplyIdentityObservations),
+                new CompxBatteryProvider(_log),
+                _profileProvider
+            },
             _log);
         _diagnostics = new DiagnosticsExporter(_paths, () => _settings, CreateDiagnosticsState, _hidInventory, _log);
 
@@ -523,6 +528,13 @@ internal sealed class TrayAppContext : ApplicationContext
         {
             reading.DeviceName,
             reading.DeviceId,
+            reading.LogicalDeviceId,
+            reading.HistoryDeviceKey,
+            reading.AssociationReceiverHistoryKey,
+            reading.AssociationReceiverSerial,
+            connectionTransport = reading.ConnectionTransport.ToString(),
+            historyAnchorEvidence = reading.HistoryAnchorEvidence.ToString(),
+            resolvedDeviceIds = DeviceIdentity.ResolvedDeviceIds(reading),
             reading.DeviceSerial,
             reading.VendorId,
             reading.ProductId,
@@ -613,6 +625,10 @@ internal sealed class TrayAppContext : ApplicationContext
 
             var result = await _providerManager.ReadAllAsync(cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
+            var identityObservations = result.ProviderResults
+                .SelectMany(batch => batch.IdentityObservations)
+                .ToArray();
+            ApplyIdentityObservations(identityObservations);
             var candidateCoverageComplete = DeviceIdentity.CandidatePathsCoveredBy(result.ProviderResults);
             if (preserveStateOnFailure
                 && (result.Readings.Count == 0 || !DeviceIdentity.PreviousReadingsCoveredBy(_lastReadings, result.Readings)))
@@ -643,16 +659,33 @@ internal sealed class TrayAppContext : ApplicationContext
             {
                 var previousRuntimeKey = DeviceIdentity.CreateRuntimeKey(rekey.PreviousReading);
                 var currentRuntimeKey = DeviceIdentity.CreateRuntimeKey(rekey.CurrentReading);
-                var alertStateMoved = _alertTracker.MoveState(previousRuntimeKey, currentRuntimeKey);
-                var pollingStateMoved = _chargingPollingPolicy.MoveState(previousRuntimeKey, currentRuntimeKey);
+                var alertStateMoved = false;
+                var pollingStateMoved = false;
+                var alertStateCleared = false;
+                if (rekey.PreservePolicyState)
+                {
+                    alertStateMoved = _alertTracker.MoveState(previousRuntimeKey, currentRuntimeKey);
+                    pollingStateMoved = _chargingPollingPolicy.MoveState(previousRuntimeKey, currentRuntimeKey);
+                }
+                else
+                {
+                    alertStateCleared = _alertTracker.Reset(previousRuntimeKey);
+                }
                 if (!string.Equals(previousRuntimeKey, currentRuntimeKey, StringComparison.OrdinalIgnoreCase))
                 {
-                    _log.Write("info", "device.policy_state_rekeyed", nameof(TrayAppContext), "success", new
+                    _log.Write("info", rekey.PreservePolicyState
+                        ? "device.policy_state_rekeyed"
+                        : "device.policy_state_epoch_reset", nameof(TrayAppContext), "success", new
                     {
                         previous_device = _log.DeviceToken(rekey.PreviousReading),
                         current_device = _log.DeviceToken(rekey.CurrentReading),
+                        preserve_policy_state = rekey.PreservePolicyState,
                         alert_state_moved = alertStateMoved,
-                        polling_state_moved = pollingStateMoved
+                        polling_state_moved = pollingStateMoved,
+                        alert_state_cleared = alertStateCleared,
+                        reason = rekey.PreservePolicyState
+                            ? "logical_identity_continuity"
+                            : "receiver_serial_epoch_changed"
                     }, reading: rekey.CurrentReading);
                 }
             }
@@ -751,6 +784,13 @@ internal sealed class TrayAppContext : ApplicationContext
         }
     }
 
+    private void ApplyIdentityObservations(IReadOnlyList<DeviceIdentityObservation> observations)
+    {
+        _deviceStates.ObserveIdentityEvidence(observations);
+        foreach (var observation in observations)
+            _history.RecordIdentityEvidence(observation);
+    }
+
     private static PollAttemptOutcome CreatePollAttemptOutcome(
         BatteryReadAllResult result,
         bool stateApplied,
@@ -769,7 +809,7 @@ internal sealed class TrayAppContext : ApplicationContext
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray(),
             usableFreshReadings
-                .Select(reading => reading.DeviceId)
+                .SelectMany(DeviceIdentity.ResolvedDeviceIds)
                 .Where(path => !string.IsNullOrWhiteSpace(path))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray(),
@@ -914,7 +954,7 @@ internal sealed class TrayAppContext : ApplicationContext
                 _deviceRefreshBurstStartedUtc = nowUtc;
                 _deviceRefreshEvents.Clear();
                 _deviceRefreshBaselinePaths = _lastReadings
-                    .Select(reading => reading.DeviceId)
+                    .SelectMany(DeviceIdentity.ResolvedDeviceIds)
                     .Where(path => !string.IsNullOrWhiteSpace(path))
                     .ToHashSet(StringComparer.OrdinalIgnoreCase);
             }
@@ -1224,8 +1264,8 @@ internal sealed class TrayAppContext : ApplicationContext
     {
         foreach (var reading in _lastReadings)
         {
-            if (!string.IsNullOrWhiteSpace(reading.DeviceId)
-                && string.Equals(reading.DeviceId, devicePath, StringComparison.OrdinalIgnoreCase))
+            if (DeviceIdentity.ResolvedDeviceIds(reading)
+                .Any(resolvedPath => string.Equals(resolvedPath, devicePath, StringComparison.OrdinalIgnoreCase)))
                 return true;
         }
 
@@ -1454,8 +1494,8 @@ internal sealed class TrayAppContext : ApplicationContext
     private static string CreateReadingStateKey(IReadOnlyList<BatteryReading> readings, string source, string failureReason)
     {
         var devices = readings
-            .OrderBy(reading => reading.DeviceId, StringComparer.OrdinalIgnoreCase)
-            .Select(reading => $"{reading.DeviceId}:{reading.BatteryPercentage}:{reading.PowerState}:{reading.ExternalPowerConnected}:{reading.Freshness}:{reading.Source}");
+            .OrderBy(DeviceIdentity.CreateRuntimeKey, StringComparer.OrdinalIgnoreCase)
+            .Select(reading => $"{DeviceIdentity.CreateRuntimeKey(reading)}:{reading.DeviceId}:{reading.ConnectionTransport}:{reading.BatteryPercentage}:{reading.PowerState}:{reading.ExternalPowerConnected}:{reading.Freshness}:{reading.Source}");
         return $"{source}|{failureReason}|{string.Join(";", devices)}";
     }
 
