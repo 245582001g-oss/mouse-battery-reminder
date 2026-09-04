@@ -4,49 +4,97 @@ namespace SoraV2BatteryTip;
 
 internal sealed class HidDeviceInventory
 {
-    private static readonly TimeSpan MaximumSnapshotAge = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan MaximumReliableSnapshotAge = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan MaximumFailedSnapshotAge = TimeSpan.FromSeconds(2);
     private readonly object _sync = new();
+    private readonly Func<IReadOnlyList<HidDevice>> _enumerateDevices;
+    private readonly Func<DateTime> _utcNow;
+    private readonly IAppEventLog? _log;
     private HidInventorySnapshot? _snapshot;
     private int _generation;
+
+    public HidDeviceInventory(
+        Func<IReadOnlyList<HidDevice>>? enumerateDevices = null,
+        Func<DateTime>? utcNow = null,
+        IAppEventLog? log = null)
+    {
+        _enumerateDevices = enumerateDevices ?? (() => DeviceList.Local.GetHidDevices().ToArray());
+        _utcNow = utcNow ?? (() => DateTime.UtcNow);
+        _log = log;
+    }
 
     public HidInventorySnapshot GetSnapshot()
     {
         lock (_sync)
         {
-            if (_snapshot != null && DateTime.UtcNow - _snapshot.CreatedUtc < MaximumSnapshotAge)
-                return _snapshot;
+            var nowUtc = _utcNow();
+            if (_snapshot != null)
+            {
+                var maximumAge = _snapshot.IsReliable ? MaximumReliableSnapshotAge : MaximumFailedSnapshotAge;
+                if (nowUtc - _snapshot.CreatedUtc < maximumAge)
+                {
+                    _log?.Write("debug", "hid.inventory.cache_hit", nameof(HidDeviceInventory), "success", new
+                    {
+                        generation = _snapshot.Generation,
+                        reliable = _snapshot.IsReliable,
+                        device_count = _snapshot.Devices.Count,
+                        age_ms = Math.Max(0, (long)(nowUtc - _snapshot.CreatedUtc).TotalMilliseconds)
+                    });
+                    return _snapshot;
+                }
+            }
 
+            var started = System.Diagnostics.Stopwatch.StartNew();
             try
             {
                 _snapshot = new HidInventorySnapshot
                 {
-                    Devices = DeviceList.Local.GetHidDevices().ToArray(),
+                    Devices = _enumerateDevices(),
                     Generation = _generation,
-                    CreatedUtc = DateTime.UtcNow,
+                    CreatedUtc = nowUtc,
                     IsReliable = true
                 };
+                _log?.Write("debug", "hid.inventory.refreshed", nameof(HidDeviceInventory), "success", new
+                {
+                    generation = _generation,
+                    device_count = _snapshot.Devices.Count,
+                    duration_ms = started.ElapsedMilliseconds
+                });
             }
             catch (Exception ex)
             {
                 _snapshot = new HidInventorySnapshot
                 {
                     Generation = _generation,
-                    CreatedUtc = DateTime.UtcNow,
+                    CreatedUtc = nowUtc,
                     IsReliable = false,
                     Error = ex.GetType().Name
                 };
+                _log?.Write("warn", "hid.inventory.failed", nameof(HidDeviceInventory), "failure", new
+                {
+                    generation = _generation,
+                    retry_after_ms = (long)MaximumFailedSnapshotAge.TotalMilliseconds,
+                    duration_ms = started.ElapsedMilliseconds
+                }, ex);
             }
 
             return _snapshot;
         }
     }
 
-    public void Invalidate()
+    public void Invalidate(string reason = "unspecified")
     {
         lock (_sync)
         {
+            var previousGeneration = _generation;
             _generation++;
             _snapshot = null;
+            _log?.Write("debug", "hid.inventory.invalidated", nameof(HidDeviceInventory), "success", new
+            {
+                reason,
+                previous_generation = previousGeneration,
+                generation = _generation
+            });
         }
     }
 }

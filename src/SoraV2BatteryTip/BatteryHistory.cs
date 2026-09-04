@@ -36,13 +36,18 @@ internal sealed class BatteryHistoryStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = false };
     private readonly AppPaths _paths;
+    private readonly IAppEventLog? _log;
     private readonly object _sync = new();
     private readonly Dictionary<string, BatteryHistoryEntry> _lastByDevice = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _legacyMigrationChecked = new(StringComparer.OrdinalIgnoreCase);
     private bool _lastCacheLoaded;
     private DateTime _lastPruneDateUtc = DateTime.MinValue;
 
-    public BatteryHistoryStore(AppPaths paths) => _paths = paths;
+    public BatteryHistoryStore(AppPaths paths, IAppEventLog? log = null)
+    {
+        _paths = paths;
+        _log = log;
+    }
 
     public void Append(BatteryReading reading)
     {
@@ -58,12 +63,12 @@ internal sealed class BatteryHistoryStore
             TimestampUtc = DateTime.UtcNow,
             DeviceKey = deviceKey,
             DeviceName = DisplayDeviceName(reading),
-            DeviceSerial = NormalizeSerial(reading.DeviceSerial),
+            DeviceSerial = DeviceIdentity.NormalizeSerial(reading.DeviceSerial) ?? "",
             VendorId = NormalizeId(reading.VendorId),
             ProductId = NormalizeId(reading.ProductId),
             BatteryPercentage = reading.BatteryPercentage,
-            IsCharging = reading.IsCharging || reading.IsFullyCharged || reading.IsCableConnected,
-            IsCableConnected = reading.IsCableConnected,
+            IsCharging = DevicePowerSemantics.IsExternallyPowered(reading),
+            IsCableConnected = DevicePowerSemantics.IsExternallyPowered(reading),
             State = "sample",
             Source = reading.Source
         });
@@ -80,7 +85,7 @@ internal sealed class BatteryHistoryStore
             TimestampUtc = DateTime.UtcNow,
             DeviceKey = deviceKey,
             DeviceName = DisplayDeviceName(reading),
-            DeviceSerial = NormalizeSerial(reading.DeviceSerial),
+            DeviceSerial = DeviceIdentity.NormalizeSerial(reading.DeviceSerial) ?? "",
             VendorId = NormalizeId(reading.VendorId),
             ProductId = NormalizeId(reading.ProductId),
             BatteryPercentage = Math.Clamp(reading.BatteryPercentage, 1, 100),
@@ -150,12 +155,30 @@ internal sealed class BatteryHistoryStore
                 _lastByDevice.TryGetValue(entry.DeviceKey, out var previous);
                 entry.State = DetermineEvent(previous, entry);
                 if (string.IsNullOrEmpty(entry.State))
+                {
+                    _log?.Write("debug", "history.suppressed_duplicate", nameof(BatteryHistoryStore), "skipped", new
+                    {
+                        device_key = entry.DeviceKey,
+                        battery_percentage = entry.BatteryPercentage
+                    });
                     return;
+                }
 
                 File.AppendAllText(_paths.HistoryPath, JsonSerializer.Serialize(entry, JsonOptions) + Environment.NewLine);
                 _lastByDevice[entry.DeviceKey] = entry;
+                _log?.Write("debug", "history.appended", nameof(BatteryHistoryStore), "success", new
+                {
+                    device_key = entry.DeviceKey,
+                    history_event = entry.State,
+                    battery_percentage = entry.BatteryPercentage,
+                    charging = entry.IsCharging,
+                    cable_connected = entry.IsCableConnected
+                });
             }
-            catch { }
+            catch (Exception ex)
+            {
+                _log?.Write("error", "history.append_failed", nameof(BatteryHistoryStore), "failure", exception: ex);
+            }
         }
     }
 
@@ -200,6 +223,11 @@ internal sealed class BatteryHistoryStore
         File.WriteAllLines(temporaryPath, entries.Select(entry => JsonSerializer.Serialize(entry, JsonOptions)));
         File.Move(temporaryPath, _paths.HistoryPath, overwrite: true);
         _lastCacheLoaded = false;
+        _log?.Write("info", "history.migrated", nameof(BatteryHistoryStore), "success", new
+        {
+            device_key = current.DeviceKey,
+            migrated_entry_count = entries.Count(entry => string.Equals(entry.DeviceKey, current.DeviceKey, StringComparison.OrdinalIgnoreCase))
+        });
     }
 
     private static string DetermineEvent(BatteryHistoryEntry? previous, BatteryHistoryEntry current)
@@ -244,7 +272,10 @@ internal sealed class BatteryHistoryStore
                 entries.Add(entry);
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            _log?.Write("warn", "history.read_failed", nameof(BatteryHistoryStore), "failure", exception: ex);
+        }
 
         return entries;
     }
@@ -263,10 +294,11 @@ internal sealed class BatteryHistoryStore
             var todayUtc = DateTime.UtcNow.Date;
             if (_lastPruneDateUtc == todayUtc)
                 return;
-            _lastPruneDateUtc = todayUtc;
-
             if (!File.Exists(_paths.HistoryPath))
+            {
+                _lastPruneDateUtc = todayUtc;
                 return;
+            }
 
             var cutoff = DateTime.UtcNow.AddDays(-30);
             var kept = ReadEntries(cutoff)
@@ -276,8 +308,17 @@ internal sealed class BatteryHistoryStore
             File.WriteAllLines(temporaryPath, kept);
             File.Move(temporaryPath, _paths.HistoryPath, overwrite: true);
             _lastCacheLoaded = false;
+            _lastPruneDateUtc = todayUtc;
+            _log?.Write("info", "history.pruned", nameof(BatteryHistoryStore), "success", new
+            {
+                cutoff_utc = cutoff,
+                kept_count = kept.Length
+            });
         }
-        catch { }
+        catch (Exception ex)
+        {
+            _log?.Write("warn", "history.prune_failed", nameof(BatteryHistoryStore), "failure", exception: ex);
+        }
     }
 
     private static string CreateDeviceKey(BatteryReading reading)
@@ -285,7 +326,7 @@ internal sealed class BatteryHistoryStore
         var vendorId = NormalizeId(reading.VendorId);
         var productId = NormalizeId(reading.ProductId);
         var name = DisplayDeviceName(reading);
-        var serial = NormalizeSerial(reading.DeviceSerial);
+        var serial = DeviceIdentity.NormalizeSerial(reading.DeviceSerial);
 
         if (!string.IsNullOrWhiteSpace(vendorId) && !string.IsNullOrWhiteSpace(productId) && !string.IsNullOrWhiteSpace(serial))
             return $"{vendorId}:{productId}:SERIAL:{serial}";
@@ -312,14 +353,6 @@ internal sealed class BatteryHistoryStore
     private static string NormalizeId(string value)
     {
         return string.IsNullOrWhiteSpace(value) ? "" : value.Trim().ToUpperInvariant();
-    }
-
-    private static string NormalizeSerial(string value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return "";
-        var normalized = NormalizeForKey(value);
-        return normalized.All(character => character == '0') ? "" : normalized;
     }
 
     private static string ShortHash(string value)

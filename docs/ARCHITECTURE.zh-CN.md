@@ -123,6 +123,22 @@ NinjutsoSoraOfficialProvider
 
 程序优先使用已验证的内置官方协议。本地学习 profile 适合暂时不值得写成内置 provider 的未知设备，但优先级更低，未来可以被内置 provider 替代。
 
+### 状态与诊断流水线
+
+```text
+Windows 设备/电源通知
+-> HidDeviceInventory（可靠快照缓存，失败快照短时重试）
+-> BatteryProviderManager（并行 provider 读取与按设备去重）
+-> DeviceBatteryStateStore（多设备合并、短时失败保留、离线与身份迁移）
+-> DevicePowerSemantics（统一插线、充电与满电语义）
+-> BatteryHistoryStore / LowBatteryAlertTracker / ChargingPollingPolicy
+-> TrayAppContext（状态文字、提示音、轮询计时器与实际图标）
+```
+
+所有关键分支同时向 `FlightRecorder` 发送结构化事件。记录器使用独立后台写线程；业务代码不直接写日志文件。一次检测的事件共享 `op_id`，设备同时带稳定关联 token 与原始名称/path/serial，因此可以直接还原 Windows 通知、实际 provider 读取、状态推导、提醒决定与图标赋值之间的完整顺序。
+
+设备运行身份变化（例如重连后的新 path，或序列号从占位值升级为真实值）会由状态存储显式上报，并同步迁移低电量提醒与充电轮询状态，避免把同一只鼠标误当成新设备。
+
 ## 数据目录
 
 ```text

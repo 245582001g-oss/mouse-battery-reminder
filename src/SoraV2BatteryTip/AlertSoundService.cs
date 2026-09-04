@@ -11,14 +11,16 @@ internal sealed class AlertSoundService
 
     private readonly AppPaths _paths;
     private readonly Func<AppSettings> _settings;
+    private readonly IAppEventLog? _log;
     private readonly object _playLock = new();
     private GCHandle _playHandle;
     private byte[]? _playBuffer;
 
-    public AlertSoundService(AppPaths paths, Func<AppSettings> settings)
+    public AlertSoundService(AppPaths paths, Func<AppSettings> settings, IAppEventLog? log = null)
     {
         _paths = paths;
         _settings = settings;
+        _log = log;
     }
 
     public string[] GetSounds()
@@ -37,8 +39,16 @@ internal sealed class AlertSoundService
     {
         var file = ResolveSoundPath(_settings().AlertSoundFile);
         if (file == null)
+        {
+            _log?.Write("warn", "sound.play_skipped", nameof(AlertSoundService), "failure", new { reason = "sound_file_missing" });
             return;
+        }
         var volume = Math.Clamp(_settings().AlertVolume, 0, 100);
+        _log?.Write("debug", "sound.play_requested", nameof(AlertSoundService), "success", new
+        {
+            sound_name = Path.GetFileName(file),
+            volume
+        });
         _ = Task.Run(() => PlayFile(file, volume));
     }
 
@@ -73,7 +83,12 @@ internal sealed class AlertSoundService
                 StopAndReleaseLocked();
                 _playBuffer = wav;
                 _playHandle = GCHandle.Alloc(_playBuffer, GCHandleType.Pinned);
-                PlaySound(_playHandle.AddrOfPinnedObject(), IntPtr.Zero, SndMemory | SndAsync | SndNoDefault);
+                var started = PlaySound(_playHandle.AddrOfPinnedObject(), IntPtr.Zero, SndMemory | SndAsync | SndNoDefault);
+                _log?.Write(started ? "debug" : "warn", "sound.play_started", nameof(AlertSoundService), started ? "success" : "failure", new
+                {
+                    sound_name = Path.GetFileName(file),
+                    volume
+                });
             }
 
             _ = Task.Run(async () =>
@@ -83,7 +98,14 @@ internal sealed class AlertSoundService
                     StopAndReleaseLocked();
             });
         }
-        catch { }
+        catch (Exception ex)
+        {
+            _log?.Write("warn", "sound.play_failed", nameof(AlertSoundService), "failure", new
+            {
+                sound_name = Path.GetFileName(file),
+                volume
+            }, ex);
+        }
     }
 
     private void StopAndReleaseLocked()

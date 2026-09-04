@@ -12,11 +12,17 @@ internal sealed class BatteryProviderManager
 {
     private readonly HidDeviceInventory _inventory;
     private readonly IReadOnlyList<IBatteryProvider> _providers;
+    private readonly IAppEventLog? _log;
 
-    public BatteryProviderManager(HidDeviceInventory inventory, IEnumerable<IBatteryProvider> providers)
+    public BatteryProviderManager(HidDeviceInventory inventory, IEnumerable<IBatteryProvider> providers, IAppEventLog? log = null)
     {
         _inventory = inventory;
         _providers = providers.OrderByDescending(provider => provider.Priority).ToArray();
+        _log = log;
+        _log?.Write("info", "providers.configured", nameof(BatteryProviderManager), "success", new
+        {
+            providers = _providers.Select(provider => new { provider.Name, provider.Priority }).ToArray()
+        });
     }
 
     public IReadOnlyList<ProviderStatus> GetProviderStatus()
@@ -36,6 +42,11 @@ internal sealed class BatteryProviderManager
             }
             catch (Exception ex)
             {
+                _log?.Write("warn", "provider.status_failed", nameof(BatteryProviderManager), "failure", new
+                {
+                    provider = provider.Name,
+                    provider.Priority
+                }, ex);
                 result.Add(new ProviderStatus
                 {
                     Name = provider.Name,
@@ -51,7 +62,27 @@ internal sealed class BatteryProviderManager
 
     public async Task<BatteryReadAllResult> ReadAllAsync(CancellationToken token)
     {
+        var started = System.Diagnostics.Stopwatch.StartNew();
         var inventory = _inventory.GetSnapshot();
+        if (!inventory.IsReliable)
+        {
+            _log?.Write("warn", "hid.inventory.retry_scheduled", nameof(BatteryProviderManager), "degraded", new
+            {
+                delay_ms = 250,
+                generation = inventory.Generation
+            });
+            await Task.Delay(250, token).ConfigureAwait(false);
+            _inventory.Invalidate("read_retry_after_inventory_failure");
+            inventory = _inventory.GetSnapshot();
+        }
+
+        _log?.Write("debug", "providers.read_started", nameof(BatteryProviderManager), "success", new
+        {
+            provider_count = _providers.Count,
+            inventory_generation = inventory.Generation,
+            inventory_reliable = inventory.IsReliable,
+            hid_device_count = inventory.Devices.Count
+        });
         var batches = await Task.WhenAll(_providers.Select(provider => ReadProviderSafelyAsync(provider, inventory, token))).ConfigureAwait(false);
         var readings = new List<BatteryReading>();
         var candidateFound = false;
@@ -77,12 +108,35 @@ internal sealed class BatteryProviderManager
             foreach (var reading in batch.Readings)
             {
                 if (!IsDuplicateReading(readings, reading))
+                {
                     readings.Add(reading);
+                    _log?.Write("debug", "provider.reading_accepted", nameof(BatteryProviderManager), "success", new
+                    {
+                        provider = _providers[i].Name,
+                        battery_percentage = reading.BatteryPercentage,
+                        charging = reading.IsCharging,
+                        cable_connected = reading.IsCableConnected
+                    }, reading: reading);
+                }
+                else
+                {
+                    _log?.Write("debug", "provider.reading_deduplicated", nameof(BatteryProviderManager), "skipped", new
+                    {
+                        provider = _providers[i].Name
+                    }, reading: reading);
+                }
             }
         }
 
         if (readings.Count > 0)
         {
+            _log?.Write("debug", "providers.read_completed", nameof(BatteryProviderManager), "success", new
+            {
+                duration_ms = started.ElapsedMilliseconds,
+                reading_count = readings.Count,
+                candidate_provider_count = candidateProviders.Count,
+                inventory_reliable = inventory.IsReliable
+            });
             return new BatteryReadAllResult
             {
                 Readings = readings,
@@ -94,28 +148,57 @@ internal sealed class BatteryProviderManager
             };
         }
 
+        var failureReason = !inventory.IsReliable || candidateFound ? "read_failed" : "not_detected";
+        _log?.Write(failureReason == "read_failed" ? "warn" : "debug", "providers.read_completed", nameof(BatteryProviderManager), "failure", new
+        {
+            duration_ms = started.ElapsedMilliseconds,
+            reading_count = 0,
+            candidate_provider_count = candidateProviders.Count,
+            inventory_reliable = inventory.IsReliable,
+            failure_reason = failureReason
+        });
         return new BatteryReadAllResult
         {
             Source = candidateFound ? string.Join(", ", candidateProviders.Distinct(StringComparer.OrdinalIgnoreCase)) : "none",
-            FailureReason = !inventory.IsReliable || candidateFound ? "read_failed" : "not_detected",
+            FailureReason = failureReason,
             HasCandidate = candidateFound,
             InventoryReliable = inventory.IsReliable,
             ProviderResults = providerResults
         };
     }
 
-    private static async Task<ProviderReadResult> ReadProviderSafelyAsync(IBatteryProvider provider, HidInventorySnapshot inventory, CancellationToken token)
+    private async Task<ProviderReadResult> ReadProviderSafelyAsync(IBatteryProvider provider, HidInventorySnapshot inventory, CancellationToken token)
     {
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        _log?.Write("debug", "provider.read_started", provider.Name, "success", new { provider.Priority });
         try
         {
-            return await provider.ReadAsync(inventory, token).ConfigureAwait(false);
+            var result = await provider.ReadAsync(inventory, token).ConfigureAwait(false);
+            _log?.Write(
+                string.IsNullOrWhiteSpace(result.Error) ? "debug" : "warn",
+                "provider.read_completed",
+                provider.Name,
+                string.IsNullOrWhiteSpace(result.Error) ? "success" : "failure",
+                new
+                {
+                    duration_ms = started.ElapsedMilliseconds,
+                    candidate_found = result.CandidateFound,
+                    candidate_count = result.CandidateDeviceIds.Count,
+                    candidate_tokens = result.CandidateDeviceIds.Select(value => _log?.TokenFor(value, "dev") ?? "dev_redacted").ToArray(),
+                    candidate_device_ids = result.CandidateDeviceIds,
+                    reading_count = result.Readings.Count,
+                    error_code = result.Error
+                });
+            return result;
         }
         catch (OperationCanceledException)
         {
+            _log?.Write("debug", "provider.read_cancelled", provider.Name, "cancelled", new { duration_ms = started.ElapsedMilliseconds });
             throw;
         }
         catch (Exception ex)
         {
+            _log?.Write("error", "provider.read_failed", provider.Name, "failure", new { duration_ms = started.ElapsedMilliseconds }, ex);
             return new ProviderReadResult { Error = ex.GetType().Name };
         }
     }

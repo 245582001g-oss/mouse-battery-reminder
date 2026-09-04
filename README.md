@@ -123,6 +123,34 @@ NinjutsoSoraOfficialProvider
 
 The app prefers verified built-in protocols first. Local learned profiles are useful for unsupported devices, but they are lower priority and can be replaced by built-in providers later.
 
+## Flight-recorder DEBUG log
+
+The app keeps an always-on, structured flight recorder. It is designed for bugs that are difficult to describe after the fact: every poll can be followed through HID inventory, provider reads, device-state reconciliation, history, alert decisions, polling policy, tray text, and tray icon changes.
+
+The live file is:
+
+```text
+%USERPROFILE%\Documents\SoraV2BatteryTip\logs\flight-current.jsonl
+```
+
+It can be read while the app is still running:
+
+```powershell
+Get-Content "$env:USERPROFILE\Documents\SoraV2BatteryTip\logs\flight-current.jsonl" -Wait
+```
+
+Each JSONL event contains UTC and local timestamps, monotonic elapsed time, a per-run sequence number, a run ID, and an operation ID that ties one battery check together. Important events include:
+
+- HID/USB arrival and removal, suspend/resume, and display power changes.
+- Provider candidates, reads, timeouts, parse rejection, retry, and recovery.
+- Battery level, cable, charging, full-charge, stale, recovered, and offline transitions.
+- Low-battery alert decisions, sound playback, polling interval changes, and every tray icon change.
+- Settings, profile tools, diagnostics export, normal shutdown, and unhandled crashes.
+
+This is a local, facts-first diagnostic log. Device records include both a stable correlation token and the original device name, HID path, and serial number; exception records include the real error message. Provider HID request/response payloads are not added separately. The live log rotates at 4 MiB or at a UTC date boundary; archives are limited to 14 days, 12 files, and 32 MiB. Right-click the tray icon and choose **Open DEBUG Log Folder** to reach it. A diagnostics export retains local state, settings, profiles, HID inventory, battery history, and a size-limited log snapshot. Inspect it yourself before sharing it with anyone else.
+
+The full event and evidence guide is in [docs/DEBUG-FLIGHT-RECORDER.zh-CN.md](docs/DEBUG-FLIGHT-RECORDER.zh-CN.md).
+
 ## Data directory
 
 ```text
@@ -135,7 +163,8 @@ Contains:
 - `status.json`
 - `sounds\*.wav`
 - `profiles\*.json`
-- battery history and diagnostics exports
+- `logs\flight-current.jsonl` and rotated flight-recorder logs
+- battery history and full-fidelity local diagnostics exports
 
 ## Build
 
@@ -143,6 +172,12 @@ Requires Windows and .NET 8 Desktop Runtime / SDK.
 
 ```powershell
 dotnet publish .\src\SoraV2BatteryTip\SoraV2BatteryTip.csproj -c Release -r win-x64 --self-contained false -o .\releases\latest
+```
+
+Run the dependency-free regression suite:
+
+```powershell
+dotnet run --project .\tests\SoraV2BatteryTip.SelfTest\SoraV2BatteryTip.SelfTest.csproj -c Release
 ```
 
 Run:

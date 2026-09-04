@@ -15,6 +15,9 @@ internal sealed class NinjutsoSoraOfficialProvider : IBatteryProvider
         0xAE11, 0xAE12, 0xAE13, 0xAE14, 0xAE15, 0xAE16,
         0xAE1C, 0xAE8A, 0xAE8C
     };
+    private readonly IAppEventLog? _log;
+
+    public NinjutsoSoraOfficialProvider(IAppEventLog? log = null) => _log = log;
 
     public string Name => "SORA V2 Official HID";
     public int Priority => 300;
@@ -26,7 +29,7 @@ internal sealed class NinjutsoSoraOfficialProvider : IBatteryProvider
         return Task.Run(() => ReadAllOnce(inventory, token), token);
     }
 
-    private static ProviderReadResult ReadAllOnce(HidInventorySnapshot inventory, CancellationToken token)
+    private ProviderReadResult ReadAllOnce(HidInventorySnapshot inventory, CancellationToken token)
     {
         var devices = EnumerateCandidateDevices(inventory).ToArray();
         var readings = new List<BatteryReading>();
@@ -47,10 +50,13 @@ internal sealed class NinjutsoSoraOfficialProvider : IBatteryProvider
         };
     }
 
-    private static BatteryReading? TryReadDevice(HidDevice device)
+    private BatteryReading? TryReadDevice(HidDevice device)
     {
         if (!device.TryOpen(out var stream) || stream == null)
+        {
+            _log?.Write("warn", "provider.device_open_failed", Name, "failure", reading: DeviceForLog(device));
             return null;
+        }
 
         using (stream)
         {
@@ -61,16 +67,29 @@ internal sealed class NinjutsoSoraOfficialProvider : IBatteryProvider
 
                 var response = QueryBatteryReport(stream, device);
                 var reading = ParseResponse(response);
+                if (reading == null)
+                {
+                    _log?.Write("warn", "provider.parse_rejected", Name, "failure", new
+                    {
+                        reason = ParseFailureReason(response),
+                        report_length = response.Length
+                    }, reading: DeviceForLog(device));
+                }
                 return reading == null ? null : EnrichReading(reading, device);
             }
-            catch
+            catch (Exception ex)
             {
+                _log?.Write("warn", "provider.io_failed", Name, "failure", new
+                {
+                    operation = "feature_query",
+                    timeout_ms = IoTimeoutMs
+                }, ex, DeviceForLog(device));
                 return null;
             }
         }
     }
 
-    private static byte[] QueryBatteryReport(HidStream stream, HidDevice device)
+    private byte[] QueryBatteryReport(HidStream stream, HidDevice device)
     {
         var length = Math.Max(MinimumFeatureLength, SafeInt(device.GetMaxFeatureReportLength));
         var request = new byte[length];
@@ -88,6 +107,11 @@ internal sealed class NinjutsoSoraOfficialProvider : IBatteryProvider
 
         if (response.Length > 9 && response[9] == 0)
         {
+            _log?.Write("debug", "provider.zero_battery_retry", Name, "success", new
+            {
+                report_id = $"0x{FeatureReportId:X2}",
+                command = $"0x{BatteryCommand:X2}"
+            }, reading: DeviceForLog(device));
             Thread.Sleep(15);
             stream.SetFeature(request, 0, request.Length);
             Thread.Sleep(5);
@@ -125,6 +149,28 @@ internal sealed class NinjutsoSoraOfficialProvider : IBatteryProvider
             Source = "SORA V2 Official HID"
         };
     }
+
+    private static string ParseFailureReason(byte[] response)
+    {
+        if (response.Length <= 10)
+            return "short_report";
+        if (response[0] != FeatureReportId)
+            return "wrong_report_id";
+        if (response[1] != BatteryCommand)
+            return "wrong_command";
+        if (response[9] is < 1 or > 100)
+            return "battery_out_of_range";
+        return "unknown";
+    }
+
+    private static BatteryReading DeviceForLog(HidDevice device) => new()
+    {
+        HasBatteryPercentage = false,
+        DeviceId = Safe(() => device.DevicePath),
+        VendorId = $"0x{device.VendorID:X4}",
+        ProductId = $"0x{device.ProductID:X4}",
+        Source = "SORA V2 Official HID"
+    };
 
     private static BatteryReading EnrichReading(BatteryReading reading, HidDevice device)
     {

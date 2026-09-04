@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <AssemblyName>SoraV2BatteryTip.SelfTest</AssemblyName>
+    <RootNamespace>SoraV2BatteryTip.SelfTest</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\SoraV2BatteryTip\SoraV2BatteryTip.csproj" />
+    <Reference Include="HidSharp">
+      <HintPath>..\..\src\SoraV2BatteryTip\Libs\HidSharp.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

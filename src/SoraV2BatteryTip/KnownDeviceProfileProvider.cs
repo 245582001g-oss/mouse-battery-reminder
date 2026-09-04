@@ -7,12 +7,14 @@ internal sealed class KnownDeviceProfileProvider : IBatteryProvider
 {
     private readonly AppPaths _paths;
     private readonly HidDeviceInventory _inventory;
+    private readonly IAppEventLog? _log;
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
 
-    public KnownDeviceProfileProvider(AppPaths paths, HidDeviceInventory inventory)
+    public KnownDeviceProfileProvider(AppPaths paths, HidDeviceInventory inventory, IAppEventLog? log = null)
     {
         _paths = paths;
         _inventory = inventory;
+        _log = log;
     }
 
     public string Name => "Known device profile";
@@ -25,7 +27,11 @@ internal sealed class KnownDeviceProfileProvider : IBatteryProvider
         return Task.Run(() => ReadAllOnce(inventory, token), token);
     }
 
-    public void ReloadProfiles() => _paths.Ensure();
+    public void ReloadProfiles()
+    {
+        _paths.Ensure();
+        _log?.Write("info", "profile.reload", nameof(KnownDeviceProfileProvider), "success");
+    }
 
     public BatteryReading? TryReadProfileFile(string file)
     {
@@ -43,7 +49,13 @@ internal sealed class KnownDeviceProfileProvider : IBatteryProvider
                     return reading;
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            _log?.Write("warn", "profile.read_file_failed", nameof(KnownDeviceProfileProvider), "failure", new
+            {
+                file_name = Path.GetFileName(file)
+            }, ex);
+        }
 
         return null;
     }
@@ -62,6 +74,7 @@ internal sealed class KnownDeviceProfileProvider : IBatteryProvider
         }
         catch (Exception ex)
         {
+            _log?.Write("warn", "profile.status_failed", nameof(KnownDeviceProfileProvider), "failure", exception: ex);
             return new[]
             {
                 new ProfileValidationStatus
@@ -114,7 +127,10 @@ internal sealed class KnownDeviceProfileProvider : IBatteryProvider
         if (!profile.ReportType.Equals("Feature", StringComparison.OrdinalIgnoreCase) || profile.BatteryOffset == null)
             return null;
         if (!device.TryOpen(out var stream) || stream == null)
+        {
+            _log?.Write("warn", "provider.device_open_failed", Name, "failure", new { profile = profile.Name }, reading: DeviceForLog(device, profile));
             return null;
+        }
 
         using (stream)
         {
@@ -140,10 +156,25 @@ internal sealed class KnownDeviceProfileProvider : IBatteryProvider
                 var response = new byte[length];
                 response[0] = ParseByte(profile.ResponseReportId) ?? request[0];
                 stream.GetFeature(response, 0, response.Length);
-                return ParseReading(profile, response, device, inventory);
+                var reading = ParseReading(profile, response, device, inventory);
+                if (reading == null)
+                {
+                    _log?.Write("warn", "provider.parse_rejected", Name, "failure", new
+                    {
+                        profile = profile.Name,
+                        reason = "profile_offsets_or_flags_invalid",
+                        report_length = response.Length
+                    }, reading: DeviceForLog(device, profile));
+                }
+                return reading;
             }
-            catch
+            catch (Exception ex)
             {
+                _log?.Write("warn", "provider.io_failed", Name, "failure", new
+                {
+                    profile = profile.Name,
+                    operation = "feature_query"
+                }, ex, DeviceForLog(device, profile));
                 return null;
             }
         }
@@ -255,12 +286,19 @@ internal sealed class KnownDeviceProfileProvider : IBatteryProvider
                     if (profile != null && profile.Enabled && ValidateProfile(profile, out _) && !IsHandledByBuiltInProvider(profile))
                         profiles.Add(profile);
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    _log?.Write("warn", "profile.validation_failed", nameof(KnownDeviceProfileProvider), "failure", new
+                    {
+                        file_name = Path.GetFileName(file)
+                    }, ex);
+                }
             }
             return profiles;
         }
-        catch
+        catch (Exception ex)
         {
+            _log?.Write("warn", "profile.load_failed", nameof(KnownDeviceProfileProvider), "failure", exception: ex);
             return Array.Empty<DeviceProfile>();
         }
     }
@@ -390,6 +428,15 @@ internal sealed class KnownDeviceProfileProvider : IBatteryProvider
         try { return getter(); }
         catch { return 0; }
     }
+
+    private static BatteryReading DeviceForLog(HidDevice device, DeviceProfile profile) => new()
+    {
+        HasBatteryPercentage = false,
+        DeviceId = Safe(() => device.DevicePath),
+        VendorId = $"0x{device.VendorID:X4}",
+        ProductId = $"0x{device.ProductID:X4}",
+        Source = string.IsNullOrWhiteSpace(profile.Name) ? "Known device profile" : profile.Name
+    };
 
     private sealed class DeviceProfile
     {

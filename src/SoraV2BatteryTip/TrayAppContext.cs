@@ -6,10 +6,6 @@ namespace SoraV2BatteryTip;
 
 internal sealed class TrayAppContext : ApplicationContext
 {
-    private const int ChargingPollingIntervalMilliseconds = 10_000;
-    private const int SteadyChargingPollingIntervalMilliseconds = 60_000;
-    private const int FullChargePollingIntervalMilliseconds = 5 * 60 * 1000;
-    private static readonly TimeSpan ChargingFastWindow = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan DeviceChangeQuietPeriod = TimeSpan.FromMilliseconds(200);
     private static readonly TimeSpan DeviceChangeMaximumCoalesce = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan[] DeviceReadRetryDelays =
@@ -20,6 +16,7 @@ internal sealed class TrayAppContext : ApplicationContext
         TimeSpan.FromSeconds(1)
     };
     private readonly AppPaths _paths;
+    private readonly IAppEventLog _log;
     private readonly SettingsStore _settingsStore;
     private readonly Localizer _text;
     private readonly AlertSoundService _sound;
@@ -28,7 +25,7 @@ internal sealed class TrayAppContext : ApplicationContext
     private readonly BatteryCandidateCollector _candidateCollector;
     private readonly ProfileDraftImporter _draftImporter;
     private readonly HidDeviceInventory _hidInventory;
-    private readonly DeviceBatteryStateStore _deviceStates = new();
+    private readonly DeviceBatteryStateStore _deviceStates;
     private readonly KnownDeviceProfileProvider _profileProvider;
     private readonly BatteryProviderManager _providerManager;
     private readonly NotifyIcon _notifyIcon;
@@ -40,8 +37,11 @@ internal sealed class TrayAppContext : ApplicationContext
     private readonly Dictionary<string, Icon> _iconCache = new(StringComparer.Ordinal);
     private readonly object _deviceRefreshSync = new();
     private readonly SemaphoreSlim _checkGate = new(1, 1);
-    private readonly Dictionary<string, int> _lastAlertedBatteryLevels = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, DateTime> _lastAlertUtcByDevice = new(StringComparer.OrdinalIgnoreCase);
+    private readonly CancellationTokenSource _shutdownCts = new();
+    private readonly LowBatteryAlertTracker _alertTracker = new();
+    private readonly ChargingPollingPolicy _chargingPollingPolicy = new();
+    private readonly Dictionary<string, DeviceRefreshEvent> _deviceRefreshEvents = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<string> _deviceRefreshBaselinePaths = new(StringComparer.OrdinalIgnoreCase);
 
     private AppSettings _settings;
     private BatteryReading? _lastReading;
@@ -56,38 +56,48 @@ internal sealed class TrayAppContext : ApplicationContext
     private int? _lastBatteryPercentage;
     private int? _lastBatteryBucket;
     private int _activePollingIntervalMilliseconds;
+    private ChargingPollingReason? _activePollingReason;
     private int _queuedCheck;
+    private string _queuedCheckTrigger = "queued";
+    private int _isDisposing;
+    private long _pollSequence;
     private bool _isDetected;
     private bool _isCableConnected;
     private bool _keepSoundMenuOpen;
     private bool _displayActive = true;
     private DateTime? _lastCheckLocal;
-    private DateTime _chargingFastUntilUtc = DateTime.MinValue;
     private DateTime _deviceRefreshBurstStartedUtc = DateTime.MinValue;
     private string _lastHidPresenceSignature = "";
     private string _lastSource = "none";
     private string _lastFailureReason = "not_detected";
     private bool _deviceRefreshForced;
     private bool _deviceRefreshTouchesTrackedDevice;
+    private bool _deviceRefreshHasUntrackedDeviceEvent;
 
-    public TrayAppContext()
+    public TrayAppContext(AppPaths paths, IAppEventLog log)
     {
-        _paths = new AppPaths();
+        _paths = paths;
+        _log = log;
+        _log.Write("info", "tray.init_started", nameof(TrayAppContext), "success");
         _paths.Ensure();
-        _settingsStore = new SettingsStore(_paths);
+        _settingsStore = new SettingsStore(_paths, _log);
         _settings = _settingsStore.Load();
         _text = new Localizer(() => _settings);
-        _sound = new AlertSoundService(_paths, () => _settings);
-        _history = new BatteryHistoryStore(_paths);
-        _diagnostics = new DiagnosticsExporter(_paths, () => _settings, CreateDiagnosticsState);
-        _hidInventory = new HidDeviceInventory();
-        _profileProvider = new KnownDeviceProfileProvider(_paths, _hidInventory);
+        _sound = new AlertSoundService(_paths, () => _settings, _log);
+        _history = new BatteryHistoryStore(_paths, _log);
+        _hidInventory = new HidDeviceInventory(log: _log);
+        _deviceStates = new DeviceBatteryStateStore(_log);
+        _profileProvider = new KnownDeviceProfileProvider(_paths, _hidInventory, _log);
         _candidateCollector = new BatteryCandidateCollector(_paths);
         _draftImporter = new ProfileDraftImporter(_paths, _profileProvider);
-        _providerManager = new BatteryProviderManager(_hidInventory, new IBatteryProvider[] { new NinjutsoSoraOfficialProvider(), new CompxBatteryProvider(), _profileProvider });
+        _providerManager = new BatteryProviderManager(
+            _hidInventory,
+            new IBatteryProvider[] { new NinjutsoSoraOfficialProvider(_log), new CompxBatteryProvider(_log), _profileProvider },
+            _log);
+        _diagnostics = new DiagnosticsExporter(_paths, () => _settings, CreateDiagnosticsState, _hidInventory, _log);
 
         if (_settings.StartupWithWindows)
-            StartupManager.SetEnabled(true);
+            StartupManager.SetEnabled(true, _log);
 
         _menu = new ContextMenuStrip { Font = new Font("Microsoft YaHei UI", 9F) };
         _menu.Closing += KeepSoundMenuOpenWhenPreviewing;
@@ -105,24 +115,32 @@ internal sealed class TrayAppContext : ApplicationContext
             Visible = true,
             ContextMenuStrip = _menu
         };
-        _notifyIcon.MouseClick += async (_, e) =>
+        _notifyIcon.MouseClick += (_, e) =>
         {
             if (e.Button == MouseButtons.Left)
-                await CheckNowAsync(clearOnMissing: true, updateUi: true);
+                ObserveUiTask(CheckNowAsync(clearOnMissing: true, updateUi: true, trigger: "manual_tray_click"), "manual_tray_check");
         };
 
         _pollTimer = new System.Windows.Forms.Timer();
-        _pollTimer.Tick += async (_, _) => await CheckNowAsync(clearOnMissing: true, updateUi: true);
+        _pollTimer.Tick += (_, _) => ObserveUiTask(
+            CheckNowAsync(clearOnMissing: true, updateUi: true, queueIfBusy: false, trigger: "timer"),
+            "timer_check");
 
         _ui = new Control();
         _ui.CreateControl();
-        _deviceChangeWindow = new DeviceChangeWindow(OnDeviceChanged, OnPowerEvent);
+        _deviceChangeWindow = new DeviceChangeWindow(OnDeviceChanged, OnPowerEvent, _log);
         var initialInventory = _hidInventory.GetSnapshot();
         if (initialInventory.IsReliable)
             _lastHidPresenceSignature = initialInventory.CreatePresenceSignature();
 
         ApplyTimerInterval();
-        _ = CheckNowAsync(clearOnMissing: true, updateUi: true);
+        _log.Write("info", "tray.init_completed", nameof(TrayAppContext), "success", new
+        {
+            initial_inventory_reliable = initialInventory.IsReliable,
+            initial_hid_device_count = initialInventory.Devices.Count,
+            initial_inventory_generation = initialInventory.Generation
+        });
+        ObserveUiTask(CheckNowAsync(clearOnMissing: true, updateUi: true, trigger: "startup"), "startup_check");
     }
 
     private void BuildMenu()
@@ -137,14 +155,21 @@ internal sealed class TrayAppContext : ApplicationContext
         if (_lastReadings.Count > 1)
         {
             foreach (var reading in _lastReadings)
-                _menu.Items.Add(new ToolStripMenuItem(FormatDeviceReading(reading)) { Enabled = false, ForeColor = IsReadingCharging(reading) ? Color.ForestGreen : SystemColors.ControlText });
+                _menu.Items.Add(new ToolStripMenuItem(FormatDeviceReading(reading)) { Enabled = false, ForeColor = DevicePowerSemantics.IsExternallyPowered(reading) ? Color.ForestGreen : SystemColors.ControlText });
         }
         _menu.Items.Add(new ToolStripSeparator());
-        _menu.Items.Add(new ToolStripMenuItem(_text["CheckNow"], null, async (_, _) => await CheckNowAsync(clearOnMissing: true, updateUi: true)));
+        _menu.Items.Add(new ToolStripMenuItem(_text["CheckNow"], null, (_, _) => ObserveUiTask(
+            CheckNowAsync(clearOnMissing: true, updateUi: true, trigger: "manual_menu"),
+            "manual_menu_check")));
         if (!_isDetected)
             _menu.Items.Add(new ToolStripMenuItem(_text["AutoSetupUnknownMouse"], null, async (_, _) => await AutoSetupUnknownMouse()));
         _menu.Items.Add(new ToolStripMenuItem(_text["BatteryHistory"], null, (_, _) => ShowBatteryHistoryWindow()));
-        _menu.Items.Add(new ToolStripMenuItem(_text["TestSound"], null, (_, _) => _sound.PlayCurrent()));
+        _menu.Items.Add(new ToolStripMenuItem(_text["TestSound"], null, (_, _) =>
+        {
+            _log.Write("info", "user.test_sound", nameof(TrayAppContext), "success");
+            _sound.PlayCurrent();
+        }));
+        _menu.Items.Add(new ToolStripMenuItem(_text["OpenDebugLogs"], null, (_, _) => OpenDebugLogs()));
         _menu.Items.Add(BuildDeviceProfilesMenu());
         _menu.Items.Add(new ToolStripSeparator());
         _lastCheckItem = new ToolStripMenuItem($"{_text["LastCheck"]}: {(_lastCheckLocal.HasValue ? _lastCheckLocal.Value.ToString("HH:mm:ss") : _text["Never"])}") { Enabled = false };
@@ -164,13 +189,17 @@ internal sealed class TrayAppContext : ApplicationContext
         {
             var enabled = !_settings.StartupWithWindows;
             SaveSettings(settings => settings.StartupWithWindows = enabled);
-            StartupManager.SetEnabled(enabled);
+            StartupManager.SetEnabled(enabled, _log);
         };
         _menu.Items.Add(startup);
 
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(new ToolStripMenuItem(_text["Uninstall"], null, (_, _) => ConfirmUninstall()));
-        _menu.Items.Add(new ToolStripMenuItem(_text["Exit"], null, (_, _) => ExitThread()));
+        _menu.Items.Add(new ToolStripMenuItem(_text["Exit"], null, (_, _) =>
+        {
+            _log.Write("info", "user.exit_requested", nameof(TrayAppContext), "success");
+            ExitThread();
+        }));
     }
 
     private ToolStripMenuItem BuildNumberMenu(string label, int current, int[] values, string suffix, Action<int> setter)
@@ -204,6 +233,7 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private void ReloadProfiles()
     {
+        _log.Write("info", "user.profile_reload_requested", nameof(TrayAppContext), "success");
         _profileProvider.ReloadProfiles();
         try { _notifyIcon.ShowBalloonTip(1800, _text["DeviceProfiles"], _text["ProfilesReloaded"], ToolTipIcon.Info); }
         catch { }
@@ -212,6 +242,7 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private void ImportLatestDrafts()
     {
+        _log.Write("info", "profile.import_started", nameof(TrayAppContext), "success", new { mode = "latest_verified" });
         var result = _draftImporter.ImportLatestVerifiedDrafts();
         _profileProvider.ReloadProfiles();
         var message = result.Total == 0
@@ -219,6 +250,14 @@ internal sealed class TrayAppContext : ApplicationContext
             : $"{_text[result.MessageKey]}: {result.Imported}/{result.Total}, rejected: {result.Rejected}";
         try { _notifyIcon.ShowBalloonTip(3000, _text["DeviceProfiles"], message, result.Imported > 0 ? ToolTipIcon.Info : ToolTipIcon.Warning); }
         catch { }
+        _log.Write("info", "profile.import_completed", nameof(TrayAppContext), result.Imported > 0 ? "success" : "skipped", new
+        {
+            result.Imported,
+            result.Rejected,
+            result.Total,
+            result.ToleranceUsed,
+            result.StableReadsRequired
+        });
         RequestMenuRebuild();
     }
 
@@ -231,6 +270,10 @@ internal sealed class TrayAppContext : ApplicationContext
         string? dir = null;
         try
         {
+            _log.Write("info", "candidate.collection_started", nameof(TrayAppContext), "success", new
+            {
+                official_battery_percentage = officialBattery.Value
+            });
             SetStatusText(_text["AutoSetupRunning"]);
             var setup = await Task.Run(() =>
             {
@@ -244,23 +287,38 @@ internal sealed class TrayAppContext : ApplicationContext
 
             if (result.Imported > 0)
             {
-                var readOk = await CheckNowAsync(clearOnMissing: true, updateUi: true);
+                var readOk = (await CheckNowAsync(clearOnMissing: true, updateUi: true, waitForGate: true, trigger: "profile_verification")).HasFreshSamples;
                 var message = readOk
                     ? $"{_text["AutoSetupSuccess"]}: {result.Imported}/{result.Total}, ±{result.ToleranceUsed}%"
                     : $"{_text["AutoSetupImportedButReadFailed"]}: {result.Imported}/{result.Total}, ±{result.ToleranceUsed}%";
                 try { _notifyIcon.ShowBalloonTip(3000, _text["DeviceProfiles"], message, readOk ? ToolTipIcon.Info : ToolTipIcon.Warning); }
                 catch { }
+                _log.Write("info", "candidate.collection_completed", nameof(TrayAppContext), readOk ? "success" : "degraded", new
+                {
+                    result.Imported,
+                    result.Rejected,
+                    result.Total,
+                    result.ToleranceUsed,
+                    verification_read_succeeded = readOk
+                });
             }
             else
             {
                 var message = $"{_text["AutoSetupFailed"]}: {result.Rejected}/{result.Total}";
                 try { _notifyIcon.ShowBalloonTip(3500, _text["DeviceProfiles"], message, ToolTipIcon.Warning); }
                 catch { }
+                _log.Write("warn", "candidate.collection_completed", nameof(TrayAppContext), "failure", new
+                {
+                    result.Imported,
+                    result.Rejected,
+                    result.Total
+                });
                 TryOpenDirectory(dir);
             }
         }
-        catch
+        catch (Exception ex)
         {
+            _log.Write("error", "candidate.collection_failed", nameof(TrayAppContext), "failure", exception: ex);
             try { _notifyIcon.ShowBalloonTip(3500, _text["DeviceProfiles"], _text["AutoSetupFailed"], ToolTipIcon.Error); }
             catch { }
             if (!string.IsNullOrWhiteSpace(dir))
@@ -305,6 +363,34 @@ internal sealed class TrayAppContext : ApplicationContext
     {
         try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(directory) { UseShellExecute = true }); }
         catch { }
+    }
+
+    private void OpenDebugLogs()
+    {
+        _log.Write("info", "user.open_debug_logs", nameof(TrayAppContext), "success");
+        _log.Flush(TimeSpan.FromSeconds(1));
+        _paths.OpenLogsDirectory();
+    }
+
+    private void ObserveUiTask(Task task, string operation)
+    {
+        _ = ObserveUiTaskAsync(task, operation);
+    }
+
+    private async Task ObserveUiTaskAsync(Task task, string operation)
+    {
+        try
+        {
+            await task;
+        }
+        catch (OperationCanceledException)
+        {
+            _log.Write("debug", "background_task.cancelled", nameof(TrayAppContext), "cancelled", new { operation });
+        }
+        catch (Exception ex)
+        {
+            _log.Write("error", "background_task.failed", nameof(TrayAppContext), "failure", new { operation }, ex);
+        }
     }
 
     private ToolStripMenuItem BuildSoundMenu()
@@ -371,6 +457,16 @@ internal sealed class TrayAppContext : ApplicationContext
     {
         update(_settings);
         _settingsStore.Save(_settings);
+        _log.Write("info", "settings.changed", nameof(TrayAppContext), "success", new
+        {
+            alert_threshold = _settings.AlertThreshold,
+            polling_interval_minutes = _settings.PollingIntervalMinutes,
+            alert_cooldown_minutes = _settings.AlertCooldownMinutes,
+            startup_with_windows = _settings.StartupWithWindows,
+            language = _settings.Language,
+            alert_sound_name = Path.GetFileName(_settings.AlertSoundFile),
+            alert_volume = _settings.AlertVolume
+        });
         ApplyTimerInterval();
         RenderTrayState();
         RequestMenuRebuild();
@@ -396,11 +492,18 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private void ExportDiagnostics()
     {
-        var dir = _diagnostics.Export();
-        try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(dir) { UseShellExecute = true }); }
-        catch { }
-        try { _notifyIcon.ShowBalloonTip(2500, _text["DiagnosticsDone"], dir, ToolTipIcon.Info); }
-        catch { }
+        try
+        {
+            var dir = _diagnostics.Export();
+            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(dir) { UseShellExecute = true }); }
+            catch (Exception ex) { _log.Write("warn", "diagnostics.open_folder_failed", nameof(TrayAppContext), "failure", exception: ex); }
+            try { _notifyIcon.ShowBalloonTip(2500, _text["DiagnosticsDone"], dir, ToolTipIcon.Info); }
+            catch (Exception ex) { _log.Write("warn", "diagnostics.balloon_failed", nameof(TrayAppContext), "failure", exception: ex); }
+        }
+        catch (Exception ex)
+        {
+            _log.Write("error", "diagnostics.user_export_failed", nameof(TrayAppContext), "failure", exception: ex);
+        }
     }
 
     private object CreateDiagnosticsState() => new
@@ -419,36 +522,90 @@ internal sealed class TrayAppContext : ApplicationContext
         readings = _lastReadings.Select(reading => new
         {
             reading.DeviceName,
+            reading.DeviceId,
+            reading.DeviceSerial,
             reading.VendorId,
             reading.ProductId,
             reading.BatteryPercentage,
+            reading.HasBatteryPercentage,
             reading.IsCharging,
+            reading.IsFullyCharged,
+            reading.IsOnline,
             reading.IsCableConnected,
+            powerState = reading.PowerState.ToString(),
+            reading.ExternalPowerConnected,
+            freshness = reading.Freshness.ToString(),
+            reading.LastSuccessfulReadUtc,
+            reading.ConsecutiveFailures,
+            reading.ProviderName,
+            reading.TimestampUtc,
             reading.Source
         }).ToArray(),
         processId = Environment.ProcessId
     };
 
-    private async Task<bool> CheckNowAsync(
+    private async Task<PollAttemptOutcome> CheckNowAsync(
         bool clearOnMissing,
         bool updateUi,
         CancellationToken cancellationToken = default,
         bool preserveStateOnFailure = false,
-        bool waitForGate = false)
+        bool waitForGate = false,
+        bool queueIfBusy = true,
+        string trigger = "internal")
     {
+        var pollSequence = Interlocked.Increment(ref _pollSequence);
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        using var operation = _log.BeginOperation($"poll-{trigger}");
+        _log.Write("debug", "poll.requested", nameof(TrayAppContext), "success", new
+        {
+            poll_sequence = pollSequence,
+            trigger,
+            clear_on_missing = clearOnMissing,
+            update_ui = updateUi,
+            preserve_state_on_failure = preserveStateOnFailure,
+            wait_for_gate = waitForGate,
+            queue_if_busy = queueIfBusy
+        });
+        if (Volatile.Read(ref _isDisposing) != 0)
+        {
+            _log.Write("debug", "poll.skipped", nameof(TrayAppContext), "cancelled", new
+            {
+                poll_sequence = pollSequence,
+                trigger,
+                reason = "application_stopping",
+                queued = false
+            });
+            return PollAttemptOutcome.NotStarted("application_stopping");
+        }
+
+        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _shutdownCts.Token);
+        cancellationToken = linkedCancellation.Token;
         cancellationToken.ThrowIfCancellationRequested();
         if (waitForGate)
         {
+            _log.Write("debug", "poll.gate_wait_started", nameof(TrayAppContext), "success", new { poll_sequence = pollSequence });
             await _checkGate.WaitAsync(cancellationToken);
         }
         else if (!await _checkGate.WaitAsync(0, cancellationToken))
         {
-            Interlocked.Exchange(ref _queuedCheck, 1);
-            return false;
+            if (queueIfBusy)
+            {
+                _queuedCheckTrigger = trigger;
+                Interlocked.Exchange(ref _queuedCheck, 1);
+            }
+            _log.Write("debug", "poll.skipped", nameof(TrayAppContext), "skipped", new
+            {
+                poll_sequence = pollSequence,
+                trigger,
+                reason = "gate_busy",
+                queued = queueIfBusy
+            });
+            return PollAttemptOutcome.NotStarted("gate_busy");
         }
 
         try
         {
+            _log.Write("debug", "poll.started", nameof(TrayAppContext), "success", new { poll_sequence = pollSequence, trigger });
             cancellationToken.ThrowIfCancellationRequested();
             var previousStateKey = CreateReadingStateKey(_lastReadings, _lastSource, _lastFailureReason);
             if (updateUi && !preserveStateOnFailure)
@@ -456,34 +613,88 @@ internal sealed class TrayAppContext : ApplicationContext
 
             var result = await _providerManager.ReadAllAsync(cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
+            var candidateCoverageComplete = DeviceIdentity.CandidatePathsCoveredBy(result.ProviderResults);
             if (preserveStateOnFailure
-                && (result.Readings.Count == 0 || !PreviousReadingsCoveredBy(_lastReadings, result.Readings)))
-                return false;
+                && (result.Readings.Count == 0 || !DeviceIdentity.PreviousReadingsCoveredBy(_lastReadings, result.Readings)))
+            {
+                _log.Write("debug", "poll.state_preserved", nameof(TrayAppContext), "degraded", new
+                {
+                    poll_sequence = pollSequence,
+                    reason = result.Readings.Count == 0 ? "no_readings" : "previous_devices_not_covered",
+                    result.FailureReason,
+                    result.InventoryReliable
+                });
+                return CreatePollAttemptOutcome(
+                    result,
+                    stateApplied: false,
+                    Array.Empty<BatteryReading>(),
+                    candidateCoverageComplete);
+            }
 
             _lastCheckLocal = DateTime.Now;
             if (_lastCheckItem is { IsDisposed: false })
                 _lastCheckItem.Text = $"{_text["LastCheck"]}: {_lastCheckLocal.Value:HH:mm:ss}";
 
             var stateUpdate = _deviceStates.Apply(result, DateTime.UtcNow, CurrentStaleThreshold());
+            var usableFreshReadings = stateUpdate.FreshReadings
+                .Where(IsUsableFreshBatterySample)
+                .ToArray();
+            foreach (var rekey in stateUpdate.Rekeys)
+            {
+                var previousRuntimeKey = DeviceIdentity.CreateRuntimeKey(rekey.PreviousReading);
+                var currentRuntimeKey = DeviceIdentity.CreateRuntimeKey(rekey.CurrentReading);
+                var alertStateMoved = _alertTracker.MoveState(previousRuntimeKey, currentRuntimeKey);
+                var pollingStateMoved = _chargingPollingPolicy.MoveState(previousRuntimeKey, currentRuntimeKey);
+                if (!string.Equals(previousRuntimeKey, currentRuntimeKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    _log.Write("info", "device.policy_state_rekeyed", nameof(TrayAppContext), "success", new
+                    {
+                        previous_device = _log.DeviceToken(rekey.PreviousReading),
+                        current_device = _log.DeviceToken(rekey.CurrentReading),
+                        alert_state_moved = alertStateMoved,
+                        polling_state_moved = pollingStateMoved
+                    }, reading: rekey.CurrentReading);
+                }
+            }
             foreach (var reading in stateUpdate.OfflineReadings)
+            {
                 _history.MarkOffline(reading);
+                var alertStateCleared = _alertTracker.Reset(DeviceIdentity.CreateRuntimeKey(reading));
+                _log.Write("debug", "alert.state_cleared", nameof(TrayAppContext), "success", new
+                {
+                    reason = "device_offline",
+                    previously_armed = alertStateCleared
+                }, reading: reading);
+            }
 
             if (stateUpdate.CurrentReadings.Count > 0)
             {
                 _lastSource = string.Join(", ", stateUpdate.CurrentReadings.Select(reading => reading.Source).Distinct(StringComparer.OrdinalIgnoreCase));
-                _lastFailureReason = stateUpdate.HasFreshSamples ? "" : "read_failed";
+                _lastFailureReason = usableFreshReadings.Length > 0 ? "" : "read_failed";
                 ApplyReadings(stateUpdate.CurrentReadings);
                 ApplyTimerInterval();
                 foreach (var reading in stateUpdate.FreshReadings)
                     _history.Append(reading);
                 if (updateUi)
                     RenderTrayState();
-                var alertReading = SelectAlertReading(stateUpdate.FreshReadings);
-                if (alertReading != null)
-                    MaybePlayAlert(alertReading);
+                ProcessLowBatteryAlerts(stateUpdate.FreshReadings);
                 if (!string.Equals(previousStateKey, CreateReadingStateKey(_lastReadings, _lastSource, _lastFailureReason), StringComparison.Ordinal))
                     RequestMenuRebuild();
-                return stateUpdate.HasFreshSamples;
+                _log.Write("debug", "poll.completed", nameof(TrayAppContext), usableFreshReadings.Length > 0 ? "success" : "degraded", new
+                {
+                    poll_sequence = pollSequence,
+                    trigger,
+                    duration_ms = started.ElapsedMilliseconds,
+                    current_count = stateUpdate.CurrentReadings.Count,
+                    fresh_count = stateUpdate.FreshReadings.Count,
+                    offline_count = stateUpdate.OfflineReadings.Count,
+                    rekey_count = stateUpdate.Rekeys.Count,
+                    candidate_coverage_complete = candidateCoverageComplete,
+                    stale = stateUpdate.HasStaleReadings,
+                    source = _lastSource,
+                    failure_reason = _lastFailureReason
+                });
+                return CreatePollAttemptOutcome(result, stateApplied: true, usableFreshReadings, candidateCoverageComplete);
             }
 
             _lastSource = result.Source;
@@ -494,18 +705,90 @@ internal sealed class TrayAppContext : ApplicationContext
                 RenderTrayState();
             if (!string.Equals(previousStateKey, CreateReadingStateKey(_lastReadings, _lastSource, _lastFailureReason), StringComparison.Ordinal))
                 RequestMenuRebuild();
-            return false;
+            _log.Write(result.FailureReason == "read_failed" ? "warn" : "debug", "poll.completed", nameof(TrayAppContext), "failure", new
+            {
+                poll_sequence = pollSequence,
+                trigger,
+                duration_ms = started.ElapsedMilliseconds,
+                source = _lastSource,
+                failure_reason = _lastFailureReason,
+                result.HasCandidate,
+                result.InventoryReliable
+            });
+            return CreatePollAttemptOutcome(result, stateApplied: true, usableFreshReadings, candidateCoverageComplete);
+        }
+        catch (OperationCanceledException)
+        {
+            _log.Write("debug", "poll.cancelled", nameof(TrayAppContext), "cancelled", new
+            {
+                poll_sequence = pollSequence,
+                trigger,
+                duration_ms = started.ElapsedMilliseconds
+            });
+            if (_shutdownCts.IsCancellationRequested)
+                return PollAttemptOutcome.NotStarted("application_stopping");
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.Write("error", "poll.failed", nameof(TrayAppContext), "failure", new
+            {
+                poll_sequence = pollSequence,
+                trigger,
+                duration_ms = started.ElapsedMilliseconds
+            }, ex);
+            throw;
         }
         finally
         {
             _checkGate.Release();
-            if (Interlocked.Exchange(ref _queuedCheck, 0) == 1)
-                _ = CheckNowAsync(clearOnMissing: true, updateUi: true);
+            if (Volatile.Read(ref _isDisposing) == 0 && Interlocked.Exchange(ref _queuedCheck, 0) == 1)
+            {
+                var queuedTrigger = _queuedCheckTrigger;
+                _log.Write("debug", "poll.queued_rerun", nameof(TrayAppContext), "success", new { poll_sequence = pollSequence, queued_trigger = queuedTrigger });
+                ObserveUiTask(CheckNowAsync(clearOnMissing: true, updateUi: true, trigger: $"queued_after_{queuedTrigger}"), "queued_check");
+            }
         }
+    }
+
+    private static PollAttemptOutcome CreatePollAttemptOutcome(
+        BatteryReadAllResult result,
+        bool stateApplied,
+        IReadOnlyList<BatteryReading> usableFreshReadings,
+        bool candidateCoverageComplete)
+    {
+        return new PollAttemptOutcome(
+            true,
+            result.InventoryReliable,
+            stateApplied,
+            usableFreshReadings.Count > 0,
+            candidateCoverageComplete,
+            result.ProviderResults
+                .SelectMany(batch => batch.CandidateDeviceIds)
+                .Where(path => !string.IsNullOrWhiteSpace(path))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray(),
+            usableFreshReadings
+                .Select(reading => reading.DeviceId)
+                .Where(path => !string.IsNullOrWhiteSpace(path))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray(),
+            result.FailureReason);
+    }
+
+    private static bool IsUsableFreshBatterySample(BatteryReading reading)
+    {
+        return reading.HasBatteryPercentage
+            && reading.BatteryPercentage is >= 1 and <= 100
+            && reading.IsOnline
+            && reading.PowerState != DevicePowerState.Offline;
     }
 
     private void ApplyReadings(IReadOnlyList<BatteryReading> readings)
     {
+        var previousDetected = _isDetected;
+        var previousCableConnected = _isCableConnected;
+        var previousBattery = _lastBatteryPercentage;
         var validReadings = readings
             .Where(reading => reading.HasBatteryPercentage
                 && reading.BatteryPercentage is >= 1 and <= 100
@@ -517,22 +800,35 @@ internal sealed class TrayAppContext : ApplicationContext
 
         if (validReadings.Length == 0)
         {
+            _log.Write("warn", "tray.readings_rejected", nameof(TrayAppContext), "failure", new
+            {
+                input_count = readings.Count,
+                reason = "no_valid_battery_reading"
+            });
             ApplyMissingReading(clearOnMissing: true);
             return;
         }
 
-        var wasCharging = _isCableConnected;
         var iconReading = SelectIconReading(validReadings);
         _lastReadings = validReadings;
         _lastReading = iconReading;
         _isDetected = true;
-        _isCableConnected = validReadings.All(IsReadingCharging);
-        if (!wasCharging && _isCableConnected)
-            _chargingFastUntilUtc = DateTime.UtcNow.Add(ChargingFastWindow);
-        else if (wasCharging && !_isCableConnected)
-            _chargingFastUntilUtc = DateTime.MinValue;
+        _isCableConnected = validReadings.All(DevicePowerSemantics.IsExternallyPowered);
         _lastBatteryPercentage = iconReading.BatteryPercentage;
         _lastBatteryBucket = ToBatteryBucket(iconReading.BatteryPercentage);
+        _log.Write("debug", "tray.readings_applied", nameof(TrayAppContext), "success", new
+        {
+            input_count = readings.Count,
+            valid_count = validReadings.Length,
+            previous_detected = previousDetected,
+            detected = _isDetected,
+            previous_all_devices_charging = previousCableConnected,
+            all_devices_charging = _isCableConnected,
+            previous_icon_battery_percentage = previousBattery,
+            icon_battery_percentage = _lastBatteryPercentage,
+            icon_battery_bucket = _lastBatteryBucket,
+            icon_device = _log.DeviceToken(iconReading)
+        }, reading: iconReading);
     }
 
     private void ApplyMissingReading(bool clearOnMissing)
@@ -540,15 +836,24 @@ internal sealed class TrayAppContext : ApplicationContext
         if (_lastFailureReason == "read_failed" && _lastReading != null)
         {
             _isDetected = true;
-            _isCableConnected = IsReadingCharging(_lastReading);
+            _isCableConnected = DevicePowerSemantics.IsExternallyPowered(_lastReading);
             if (_lastReadings.Count == 0)
                 _lastReadings = new[] { _lastReading };
+            _log.Write("warn", "tray.state_preserved", nameof(TrayAppContext), "degraded", new
+            {
+                reason = "read_failed",
+                clear_on_missing = clearOnMissing
+            }, reading: _lastReading);
             return;
         }
 
         if (!clearOnMissing && _lastReading != null)
         {
             _isDetected = true;
+            _log.Write("debug", "tray.state_preserved", nameof(TrayAppContext), "degraded", new
+            {
+                reason = "clear_disabled"
+            }, reading: _lastReading);
             return;
         }
 
@@ -558,7 +863,11 @@ internal sealed class TrayAppContext : ApplicationContext
         _lastReading = null;
         _lastBatteryPercentage = null;
         _lastBatteryBucket = null;
-        _chargingFastUntilUtc = DateTime.MinValue;
+        _log.Write("info", "tray.state_cleared", nameof(TrayAppContext), "success", new
+        {
+            reason = _lastFailureReason,
+            clear_on_missing = clearOnMissing
+        });
     }
 
     private void OnDeviceChanged(string devicePath, bool arrived)
@@ -568,28 +877,59 @@ internal sealed class TrayAppContext : ApplicationContext
 
         if (devicePath.Contains("hid#", StringComparison.OrdinalIgnoreCase))
         {
-            _hidInventory.Invalidate();
-            ScheduleRefreshAfterChange(devicePath);
+            var tracked = IsExactTrackedDevicePath(devicePath);
+            _log.Write("info", arrived ? "system.device_arrival" : "system.device_removal", nameof(TrayAppContext), "success", new
+            {
+                device_token = _log.TokenFor(devicePath, "dev"),
+                device_path = devicePath,
+                tracked_device = tracked,
+                interface_type = "hid",
+                fact_basis = "windows_wm_devicechange"
+            });
+            _hidInventory.Invalidate(arrived ? "device_arrival" : "device_removal");
+            ScheduleRefreshAfterChange(devicePath, deviceArrived: arrived);
         }
     }
 
     private void ScheduleRefreshAfterChange(
         string? devicePath = null,
         bool forceRefresh = false,
-        TimeSpan? quietPeriod = null)
+        TimeSpan? quietPeriod = null,
+        bool? deviceArrived = null)
     {
         CancellationTokenSource current;
         TimeSpan delay;
         bool touchesTrackedDevice;
         bool forced;
+        bool requiresFullRetryWindow;
+        IReadOnlyList<DeviceRefreshEvent> refreshEvents;
+        IReadOnlySet<string> baselineDevicePaths;
+        var hasDeviceEvent = !string.IsNullOrWhiteSpace(devicePath);
+        var exactTrackedDevice = hasDeviceEvent && IsExactTrackedDevicePath(devicePath!);
         lock (_deviceRefreshSync)
         {
             var nowUtc = DateTime.UtcNow;
             if (_deviceRefreshCts == null || _deviceRefreshBurstStartedUtc == DateTime.MinValue)
+            {
                 _deviceRefreshBurstStartedUtc = nowUtc;
+                _deviceRefreshEvents.Clear();
+                _deviceRefreshBaselinePaths = _lastReadings
+                    .Select(reading => reading.DeviceId)
+                    .Where(path => !string.IsNullOrWhiteSpace(path))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            }
+
+            if (hasDeviceEvent)
+            {
+                _deviceRefreshEvents[devicePath!] = new DeviceRefreshEvent(
+                    devicePath!,
+                    deviceArrived ?? true,
+                    exactTrackedDevice);
+            }
 
             _deviceRefreshForced |= forceRefresh;
-            _deviceRefreshTouchesTrackedDevice |= !string.IsNullOrWhiteSpace(devicePath) && IsTrackedDevicePath(devicePath);
+            _deviceRefreshTouchesTrackedDevice |= exactTrackedDevice;
+            _deviceRefreshHasUntrackedDeviceEvent = _deviceRefreshEvents.Values.Any(item => item.Arrived && !item.WasTracked);
 
             var requestedDelay = quietPeriod ?? DeviceChangeQuietPeriod;
             var remaining = DeviceChangeMaximumCoalesce - (nowUtc - _deviceRefreshBurstStartedUtc);
@@ -599,21 +939,48 @@ internal sealed class TrayAppContext : ApplicationContext
                     ? requestedDelay
                     : remaining;
 
+            var coalesced = _deviceRefreshCts != null;
             _deviceRefreshCts?.Cancel();
             _deviceRefreshCts = new CancellationTokenSource();
             current = _deviceRefreshCts;
             touchesTrackedDevice = _deviceRefreshTouchesTrackedDevice;
             forced = _deviceRefreshForced;
+            requiresFullRetryWindow = _deviceRefreshHasUntrackedDeviceEvent;
+            refreshEvents = _deviceRefreshEvents.Values.ToArray();
+            baselineDevicePaths = _deviceRefreshBaselinePaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            _log.Write("debug", coalesced ? "device_refresh.coalesced" : "device_refresh.scheduled", nameof(TrayAppContext), "success", new
+            {
+                delay_ms = (long)delay.TotalMilliseconds,
+                force_refresh = forced,
+                touches_tracked_device = touchesTrackedDevice,
+                has_device_event = hasDeviceEvent,
+                device_arrived = deviceArrived,
+                requires_full_retry_window = requiresFullRetryWindow,
+                coalesced_event_count = refreshEvents.Count
+            });
         }
-        _ = RefreshAfterDeviceChangeAsync(delay, current, forced, touchesTrackedDevice);
+        ObserveUiTask(
+            RefreshAfterDeviceChangeAsync(
+                delay,
+                current,
+                forced,
+                touchesTrackedDevice,
+                requiresFullRetryWindow,
+                refreshEvents,
+                baselineDevicePaths),
+            "device_refresh");
     }
 
     private async Task RefreshAfterDeviceChangeAsync(
         TimeSpan delay,
         CancellationTokenSource owner,
         bool forceRefresh,
-        bool touchesTrackedDevice)
+        bool touchesTrackedDevice,
+        bool requiresFullRetryWindow,
+        IReadOnlyList<DeviceRefreshEvent> refreshEvents,
+        IReadOnlySet<string> baselineDevicePaths)
     {
+        var started = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             await Task.Delay(delay, owner.Token).ConfigureAwait(false);
@@ -627,8 +994,21 @@ internal sealed class TrayAppContext : ApplicationContext
 
             var signatureChanged = !snapshot.IsReliable
                 || !string.Equals(previousSignature, signature, StringComparison.OrdinalIgnoreCase);
-            if (!forceRefresh && !touchesTrackedDevice && !signatureChanged)
+            if (refreshEvents.Count == 0 && !forceRefresh && !touchesTrackedDevice && !requiresFullRetryWindow && !signatureChanged)
+            {
+                if (!TryCompleteDeviceRefresh(owner, snapshot, signature, () =>
+                    _log.Write("debug", "device_refresh.skipped", nameof(TrayAppContext), "skipped", new
+                    {
+                        reason = "presence_unchanged",
+                        duration_ms = started.ElapsedMilliseconds,
+                        snapshot.Generation,
+                        snapshot.IsReliable
+                    })))
+                {
+                    throw new OperationCanceledException(owner.Token);
+                }
                 return;
+            }
 
             for (var attempt = 0; attempt < DeviceReadRetryDelays.Length; attempt++)
             {
@@ -636,7 +1016,7 @@ internal sealed class TrayAppContext : ApplicationContext
                 if (retryDelay > TimeSpan.Zero)
                 {
                     await Task.Delay(retryDelay, owner.Token).ConfigureAwait(false);
-                    _hidInventory.Invalidate();
+                    _hidInventory.Invalidate("device_refresh_retry");
                     snapshot = _hidInventory.GetSnapshot();
                     if (snapshot.IsReliable)
                         signature = snapshot.CreatePresenceSignature();
@@ -644,18 +1024,83 @@ internal sealed class TrayAppContext : ApplicationContext
 
                 owner.Token.ThrowIfCancellationRequested();
                 var finalAttempt = attempt == DeviceReadRetryDelays.Length - 1;
-                var succeeded = await InvokeDeviceCheckAsync(finalAttempt, owner.Token).ConfigureAwait(false);
-                if (succeeded)
+                _log.Write("debug", "device_refresh.retry", nameof(TrayAppContext), "success", new
                 {
-                    CommitHidPresenceSignature(snapshot, signature);
+                    attempt = attempt + 1,
+                    attempt_count = DeviceReadRetryDelays.Length,
+                    delay_ms = (long)retryDelay.TotalMilliseconds,
+                    final_attempt = finalAttempt,
+                    snapshot_reliable = snapshot.IsReliable,
+                    snapshot_generation = snapshot.Generation
+                });
+                var poll = await InvokeDeviceCheckAsync(finalAttempt, owner.Token).ConfigureAwait(false);
+                owner.Token.ThrowIfCancellationRequested();
+                var decision = DeviceRefreshPolicy.Evaluate(
+                    refreshEvents,
+                    baselineDevicePaths,
+                    SnapshotDevicePaths(snapshot),
+                    snapshot.IsReliable,
+                    poll,
+                    finalAttempt);
+                if (decision.IsComplete)
+                {
+                    var level = decision.Outcome switch
+                    {
+                        "failure" => "warn",
+                        "degraded" => "warn",
+                        "skipped" => "debug",
+                        _ => "info"
+                    };
+                    if (!TryCompleteDeviceRefresh(owner, snapshot, signature, () =>
+                        _log.Write(level, "device_refresh.completed", nameof(TrayAppContext), decision.Outcome, new
+                        {
+                            attempt = attempt + 1,
+                            duration_ms = started.ElapsedMilliseconds,
+                            reason = decision.Reason,
+                            event_count = refreshEvents.Count,
+                            arrival_count = refreshEvents.Count(item => item.Arrived),
+                            removal_count = refreshEvents.Count(item => !item.Arrived),
+                            poll_completed = poll.PollCompleted,
+                            poll_inventory_reliable = poll.InventoryReliable,
+                            poll_state_applied = poll.StateApplied,
+                            fresh_count = poll.FreshDevicePaths.Count,
+                            candidate_count = poll.CandidateDevicePaths.Count,
+                            candidate_coverage_complete = poll.CandidateCoverageComplete
+                        })))
+                    {
+                        throw new OperationCanceledException(owner.Token);
+                    }
                     return;
                 }
+                owner.Token.ThrowIfCancellationRequested();
+                _log.Write("debug", "device_refresh.retry_continued", nameof(TrayAppContext), "success", new
+                {
+                    attempt = attempt + 1,
+                    reason = decision.Reason,
+                    poll_completed = poll.PollCompleted,
+                    fresh_count = poll.FreshDevicePaths.Count,
+                    candidate_count = poll.CandidateDevicePaths.Count
+                });
             }
 
-            CommitHidPresenceSignature(snapshot, signature);
+            if (!TryCompleteDeviceRefresh(owner, snapshot, signature, () =>
+                _log.Write("warn", "device_refresh.completed", nameof(TrayAppContext), "failure", new
+                {
+                    attempt_count = DeviceReadRetryDelays.Length,
+                    duration_ms = started.ElapsedMilliseconds
+                })))
+            {
+                throw new OperationCanceledException(owner.Token);
+            }
         }
-        catch (OperationCanceledException) { }
-        catch { }
+        catch (OperationCanceledException)
+        {
+            _log.Write("debug", "device_refresh.cancelled", nameof(TrayAppContext), "cancelled", new { duration_ms = started.ElapsedMilliseconds });
+        }
+        catch (Exception ex)
+        {
+            _log.Write("error", "device_refresh.failed", nameof(TrayAppContext), "failure", new { duration_ms = started.ElapsedMilliseconds }, ex);
+        }
         finally
         {
             lock (_deviceRefreshSync)
@@ -666,25 +1111,32 @@ internal sealed class TrayAppContext : ApplicationContext
                     _deviceRefreshBurstStartedUtc = DateTime.MinValue;
                     _deviceRefreshForced = false;
                     _deviceRefreshTouchesTrackedDevice = false;
+                    _deviceRefreshHasUntrackedDeviceEvent = false;
+                    _deviceRefreshEvents.Clear();
+                    _deviceRefreshBaselinePaths.Clear();
                 }
             }
             owner.Dispose();
         }
     }
 
-    private Task<bool> InvokeDeviceCheckAsync(bool finalAttempt, CancellationToken token)
+    private Task<PollAttemptOutcome> InvokeDeviceCheckAsync(bool finalAttempt, CancellationToken token)
     {
-        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var completion = new TaskCompletionSource<PollAttemptOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
         if (token.IsCancellationRequested)
         {
+            _log.Write("debug", "device_check.invoke_skipped", nameof(TrayAppContext), "cancelled", new { reason = "token_cancelled" });
             completion.TrySetCanceled(token);
             return completion.Task;
         }
         if (_ui.IsDisposed || !_ui.IsHandleCreated)
         {
-            completion.TrySetResult(false);
+            _log.Write("warn", "device_check.invoke_skipped", nameof(TrayAppContext), "failure", new { reason = "ui_handle_unavailable" });
+            completion.TrySetResult(PollAttemptOutcome.NotStarted("ui_handle_unavailable"));
             return completion.Task;
         }
+
+        token.Register(() => completion.TrySetCanceled(token));
 
         try
         {
@@ -698,122 +1150,114 @@ internal sealed class TrayAppContext : ApplicationContext
                         updateUi: true,
                         cancellationToken: token,
                         preserveStateOnFailure: !finalAttempt,
-                        waitForGate: true);
+                        waitForGate: true,
+                        trigger: "device_change_retry");
                     completion.TrySetResult(result);
                 }
                 catch (OperationCanceledException)
                 {
                     completion.TrySetCanceled(token);
                 }
-                catch
+                catch (Exception ex)
                 {
-                    completion.TrySetResult(false);
+                    _log.Write("error", "device_check.failed", nameof(TrayAppContext), "failure", exception: ex);
+                    completion.TrySetResult(PollAttemptOutcome.NotStarted("device_check_failed"));
                 }
             }));
         }
-        catch
+        catch (Exception ex)
         {
-            completion.TrySetResult(false);
+            _log.Write("error", "device_check.invoke_failed", nameof(TrayAppContext), "failure", exception: ex);
+            completion.TrySetResult(PollAttemptOutcome.NotStarted("invoke_failed"));
         }
 
         return completion.Task;
     }
 
-    private void CommitHidPresenceSignature(HidInventorySnapshot snapshot, string signature)
+    private bool TryCompleteDeviceRefresh(
+        CancellationTokenSource owner,
+        HidInventorySnapshot snapshot,
+        string signature,
+        Action writeCompletion)
     {
-        if (!snapshot.IsReliable)
-            return;
+        ArgumentNullException.ThrowIfNull(owner);
+        ArgumentNullException.ThrowIfNull(snapshot);
+        ArgumentNullException.ThrowIfNull(writeCompletion);
 
         lock (_deviceRefreshSync)
-            _lastHidPresenceSignature = signature;
+        {
+            if (owner.IsCancellationRequested || !ReferenceEquals(_deviceRefreshCts, owner))
+                return false;
+
+            if (snapshot.IsReliable)
+                _lastHidPresenceSignature = signature;
+            _deviceRefreshCts = null;
+            _deviceRefreshBurstStartedUtc = DateTime.MinValue;
+            _deviceRefreshForced = false;
+            _deviceRefreshTouchesTrackedDevice = false;
+            _deviceRefreshHasUntrackedDeviceEvent = false;
+            _deviceRefreshEvents.Clear();
+            _deviceRefreshBaselinePaths.Clear();
+            writeCompletion();
+            return true;
+        }
     }
 
-    private bool IsTrackedDevicePath(string devicePath)
+    private static IReadOnlySet<string> SnapshotDevicePaths(HidInventorySnapshot snapshot)
+    {
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var device in snapshot.Devices)
+        {
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(device.DevicePath))
+                    paths.Add(device.DevicePath);
+            }
+            catch
+            {
+            }
+        }
+        return paths;
+    }
+
+    private bool IsExactTrackedDevicePath(string devicePath)
     {
         foreach (var reading in _lastReadings)
         {
             if (!string.IsNullOrWhiteSpace(reading.DeviceId)
                 && string.Equals(reading.DeviceId, devicePath, StringComparison.OrdinalIgnoreCase))
                 return true;
-
-            var vendorId = NormalizeUsbIdentifier(reading.VendorId);
-            var productId = NormalizeUsbIdentifier(reading.ProductId);
-            if (vendorId != null
-                && productId != null
-                && devicePath.Contains($"vid_{vendorId}", StringComparison.OrdinalIgnoreCase)
-                && devicePath.Contains($"pid_{productId}", StringComparison.OrdinalIgnoreCase))
-                return true;
         }
 
         return false;
-    }
-
-    private static string? NormalizeUsbIdentifier(string value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return null;
-
-        var normalized = value.Trim();
-        if (normalized.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
-            normalized = normalized[2..];
-        if (!int.TryParse(normalized, System.Globalization.NumberStyles.HexNumber, null, out var parsed))
-            return null;
-        return parsed.ToString("X4");
-    }
-
-    private static bool PreviousReadingsCoveredBy(
-        IReadOnlyList<BatteryReading> previousReadings,
-        IReadOnlyList<BatteryReading> currentReadings)
-    {
-        if (previousReadings.Count == 0)
-            return currentReadings.Count > 0;
-
-        return previousReadings.All(previous => currentReadings.Any(current => IsSamePhysicalDevice(previous, current)));
-    }
-
-    private static bool IsSamePhysicalDevice(BatteryReading previous, BatteryReading current)
-    {
-        if (!string.IsNullOrWhiteSpace(previous.DeviceId)
-            && string.Equals(previous.DeviceId, current.DeviceId, StringComparison.OrdinalIgnoreCase))
-            return true;
-        if (!string.Equals(previous.VendorId, current.VendorId, StringComparison.OrdinalIgnoreCase)
-            || !string.Equals(previous.Source, current.Source, StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        var previousSerial = NormalizeDeviceSerial(previous.DeviceSerial);
-        var currentSerial = NormalizeDeviceSerial(current.DeviceSerial);
-        if (previousSerial != null && currentSerial != null)
-            return string.Equals(previousSerial, currentSerial, StringComparison.OrdinalIgnoreCase);
-
-        return !string.IsNullOrWhiteSpace(previous.DeviceName)
-            && string.Equals(previous.DeviceName.Trim(), current.DeviceName.Trim(), StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static string? NormalizeDeviceSerial(string? serial)
-    {
-        if (string.IsNullOrWhiteSpace(serial))
-            return null;
-
-        var normalized = serial.Trim();
-        return normalized.All(character => character is '0' or '-' or ' ')
-            ? null
-            : normalized;
     }
 
     private void CancelPendingDeviceRefresh()
     {
         lock (_deviceRefreshSync)
         {
+            var hadPendingRefresh = _deviceRefreshCts != null;
             _deviceRefreshCts?.Cancel();
             _deviceRefreshCts = null;
             _deviceRefreshBurstStartedUtc = DateTime.MinValue;
             _deviceRefreshForced = false;
             _deviceRefreshTouchesTrackedDevice = false;
+            _deviceRefreshHasUntrackedDeviceEvent = false;
+            _deviceRefreshEvents.Clear();
+            _deviceRefreshBaselinePaths.Clear();
+            if (hadPendingRefresh)
+                _log.Write("debug", "device_refresh.cancelled", nameof(TrayAppContext), "cancelled", new { reason = "system_suspend_or_shutdown" });
         }
     }
 
     private void OnPowerEvent(PowerBroadcastEvent powerEvent)
     {
+        _log.Write("info", "system.power_change", nameof(TrayAppContext), "success", new
+        {
+            power_event = powerEvent.ToString(),
+            display_active_before = _displayActive,
+            polling_interval_ms_before = _activePollingIntervalMilliseconds
+        });
         switch (powerEvent)
         {
             case PowerBroadcastEvent.Suspend:
@@ -822,7 +1266,7 @@ internal sealed class TrayAppContext : ApplicationContext
                 break;
             case PowerBroadcastEvent.Resume:
                 _displayActive = true;
-                _hidInventory.Invalidate();
+                _hidInventory.Invalidate("system_resume");
                 ScheduleRefreshAfterChange(forceRefresh: true, quietPeriod: TimeSpan.FromMilliseconds(300));
                 break;
             case PowerBroadcastEvent.DisplayOff:
@@ -902,11 +1346,23 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private void SetStatusText(string text)
     {
+        var changed = !string.Equals(_statusText, text, StringComparison.Ordinal);
+        var previous = _statusText;
         _statusText = text;
         if (_statusItem is { IsDisposed: false })
         {
             _statusItem.Text = text;
             _statusItem.ForeColor = _isCableConnected ? Color.ForestGreen : SystemColors.ControlText;
+        }
+        if (changed)
+        {
+            _log.Write("debug", "tray.status_changed", nameof(TrayAppContext), "success", new
+            {
+                previous_status = previous,
+                status = text,
+                detected = _isDetected,
+                all_devices_charging = _isCableConnected
+            });
         }
     }
 
@@ -914,54 +1370,79 @@ internal sealed class TrayAppContext : ApplicationContext
     {
         if (string.Equals(_lastTrayText, text, StringComparison.Ordinal))
             return;
+        var previous = _lastTrayText;
         _lastTrayText = text;
         _notifyIcon.Text = text;
-    }
-
-    private void MaybePlayAlert(BatteryReading reading)
-    {
-        if (!reading.HasBatteryPercentage || reading.BatteryPercentage <= 0)
-            return;
-
-        var deviceKey = string.IsNullOrWhiteSpace(reading.DeviceId)
-            ? $"{reading.VendorId}:{reading.ProductId}:{reading.Source}"
-            : reading.DeviceId;
-
-        if (reading.IsCableConnected || reading.IsCharging || reading.IsFullyCharged || reading.BatteryPercentage > _settings.AlertThreshold)
+        _log.Write("debug", "tray.tooltip_changed", nameof(TrayAppContext), "success", new
         {
-            _lastAlertedBatteryLevels.Remove(deviceKey);
-            _lastAlertUtcByDevice.Remove(deviceKey);
-            return;
-        }
-
-        var alertLevel = AlertLevelFor(reading.BatteryPercentage);
-        if (_lastAlertedBatteryLevels.TryGetValue(deviceKey, out var lastAlertedLevel) && alertLevel >= lastAlertedLevel)
-            return;
-
-        if (_lastAlertUtcByDevice.TryGetValue(deviceKey, out var lastAlertUtc)
-            && DateTime.UtcNow < lastAlertUtc.AddMinutes(_settings.AlertCooldownMinutes))
-            return;
-
-        _lastAlertUtcByDevice[deviceKey] = DateTime.UtcNow;
-        _lastAlertedBatteryLevels[deviceKey] = alertLevel;
-        _sound.PlayCurrent();
+            previous_tooltip = previous,
+            tooltip = text
+        });
     }
 
-    private static int AlertLevelFor(int batteryPercentage) => Math.Clamp((batteryPercentage / 5) * 5, 0, 100);
+    private void ProcessLowBatteryAlerts(IReadOnlyList<BatteryReading> readings)
+    {
+        var input = readings
+            .Select(reading => new LowBatteryAlertInput(
+                DeviceIdentity.CreateRuntimeKey(reading),
+                reading.BatteryPercentage,
+                reading.HasBatteryPercentage,
+                DevicePowerSemantics.IsExternallyPowered(reading),
+                DevicePowerSemantics.IsFullyCharged(reading),
+                DevicePowerSemantics.IsExternallyPowered(reading)))
+            .ToArray();
+        var result = _alertTracker.Update(input, DateTime.UtcNow, _settings);
+        foreach (var decision in result.Decisions)
+        {
+            var reading = readings.FirstOrDefault(item => string.Equals(DeviceIdentity.CreateRuntimeKey(item), decision.DeviceKey, StringComparison.OrdinalIgnoreCase));
+            var eventName = decision.Disposition switch
+            {
+                LowBatteryAlertDisposition.Played => "alert.fired",
+                LowBatteryAlertDisposition.Reset => "alert.reset",
+                _ => "alert.suppressed"
+            };
+            var level = decision.Disposition == LowBatteryAlertDisposition.Played ? "info" : "debug";
+            _log.Write(level, eventName, nameof(TrayAppContext), decision.Disposition == LowBatteryAlertDisposition.Played ? "success" : "skipped", new
+            {
+                decision.BatteryPercentage,
+                reason = decision.Reason,
+                threshold = _settings.AlertThreshold,
+                cooldown_minutes = _settings.AlertCooldownMinutes,
+                batch_sound_requested = result.ShouldPlaySound
+            }, reading: reading);
+        }
+        if (result.ShouldPlaySound)
+            _sound.PlayCurrent();
+    }
 
     private void ApplyTimerInterval()
     {
-        var chargingReadings = _lastReadings.Where(IsReadingCharging).ToArray();
-        var intervalMilliseconds = chargingReadings.Length == 0
-            ? Math.Max(1, _settings.PollingIntervalMinutes) * 60 * 1000
-            : chargingReadings.All(IsReadingFullyCharged)
-                ? FullChargePollingIntervalMilliseconds
-                : !_displayActive
-                    ? SteadyChargingPollingIntervalMilliseconds
-                    : DateTime.UtcNow < _chargingFastUntilUtc
-                        ? ChargingPollingIntervalMilliseconds
-                        : SteadyChargingPollingIntervalMilliseconds;
-        if (_pollTimer.Enabled && _activePollingIntervalMilliseconds == intervalMilliseconds)
+        var devices = _lastReadings
+            .Select(reading => new ChargingPollingDevice(
+                DeviceIdentity.CreateRuntimeKey(reading),
+                DevicePowerSemantics.IsExternallyPowered(reading),
+                DevicePowerSemantics.IsFullyCharged(reading)))
+            .ToArray();
+        var decision = _chargingPollingPolicy.Evaluate(devices, _displayActive, DateTime.UtcNow, _settings);
+        var intervalMilliseconds = (int)Math.Clamp(decision.Interval.TotalMilliseconds, 1, int.MaxValue);
+        var intervalChanged = !_pollTimer.Enabled || _activePollingIntervalMilliseconds != intervalMilliseconds;
+        var reasonChanged = _activePollingReason != decision.Reason;
+        if (!intervalChanged && !reasonChanged)
+            return;
+
+        _log.Write("info", "poll.interval_changed", nameof(TrayAppContext), "success", new
+        {
+            previous_interval_ms = _activePollingIntervalMilliseconds,
+            interval_ms = intervalMilliseconds,
+            previous_reason = _activePollingReason?.ToString(),
+            reason = decision.Reason.ToString(),
+            charging_device_count = decision.ChargingDeviceKeys.Count,
+            newly_charging_device_count = decision.NewlyChargingDeviceKeys.Count,
+            display_active = _displayActive,
+            fast_until_utc = decision.FastUntilUtc == DateTime.MinValue ? (DateTime?)null : decision.FastUntilUtc
+        });
+        _activePollingReason = decision.Reason;
+        if (!intervalChanged)
             return;
 
         _pollTimer.Stop();
@@ -1029,6 +1510,10 @@ internal sealed class TrayAppContext : ApplicationContext
     private void ConfirmUninstall()
     {
         var result = MessageBox.Show(_text["UninstallConfirm"], _text["UninstallTitle"], MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+        _log.Write("info", "uninstall.confirmation", nameof(TrayAppContext), result == DialogResult.Yes ? "success" : "cancelled", new
+        {
+            confirmed = result == DialogResult.Yes
+        });
         if (result == DialogResult.Yes)
             BeginUninstall();
     }
@@ -1037,14 +1522,19 @@ internal sealed class TrayAppContext : ApplicationContext
     {
         try
         {
+            _log.Write("warn", "uninstall.started", nameof(TrayAppContext), "success");
+            _log.Flush(TimeSpan.FromSeconds(1));
             _settings.StartupWithWindows = false;
             _settingsStore.Save(_settings);
-            StartupManager.SetEnabled(false);
+            StartupManager.SetEnabled(false, _log);
             CleanRegistryRecords();
             if (Directory.Exists(_paths.DataDirectory))
                 Directory.Delete(_paths.DataDirectory, recursive: true);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            _log.Write("error", "uninstall.cleanup_failed", nameof(TrayAppContext), "failure", exception: ex);
+        }
 
         try { _notifyIcon.ShowBalloonTip(2500, _text["UninstallStartedTitle"], _text["UninstallStarted"], ToolTipIcon.Info); }
         catch { }
@@ -1173,34 +1663,10 @@ internal sealed class TrayAppContext : ApplicationContext
     private BatteryReading SelectIconReading(IReadOnlyList<BatteryReading> readings)
     {
         return readings
-            .Where(reading => !IsReadingCharging(reading))
+            .Where(reading => !DevicePowerSemantics.IsExternallyPowered(reading))
             .OrderBy(reading => reading.BatteryPercentage)
             .FirstOrDefault()
             ?? readings.OrderBy(reading => reading.BatteryPercentage).First();
-    }
-
-    private static BatteryReading? SelectAlertReading(IReadOnlyList<BatteryReading> readings)
-    {
-        return readings
-            .Where(reading => !IsReadingCharging(reading))
-            .OrderBy(reading => reading.BatteryPercentage)
-            .FirstOrDefault();
-    }
-
-    private static bool IsReadingCharging(BatteryReading reading)
-    {
-        return reading.PowerState is DevicePowerState.Charging or DevicePowerState.FullyCharged or DevicePowerState.PendingCharge
-            || reading.ExternalPowerConnected == true
-            || reading.IsCableConnected
-            || reading.IsCharging
-            || reading.IsFullyCharged;
-    }
-
-    private static bool IsReadingFullyCharged(BatteryReading reading)
-    {
-        return reading.PowerState == DevicePowerState.FullyCharged
-            || reading.IsFullyCharged
-            || (IsReadingCharging(reading) && reading.BatteryPercentage >= 100);
     }
 
     private string MouseCountLabel(int count)
@@ -1212,7 +1678,7 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private string FormatCompactReading(BatteryReading reading)
     {
-        var value = IsReadingCharging(reading)
+        var value = DevicePowerSemantics.IsExternallyPowered(reading)
             ? $"{reading.BatteryPercentage}% {_text["Charging"]}"
             : $"{reading.BatteryPercentage}%";
         return reading.Freshness == BatteryDataFreshness.Stale
@@ -1240,7 +1706,7 @@ internal sealed class TrayAppContext : ApplicationContext
         var fullyCharged = cableConnected
             && batteryBucket >= 100
             && _lastReadings.Count > 0
-            && _lastReadings.All(IsReadingFullyCharged);
+            && _lastReadings.All(DevicePowerSemantics.IsFullyCharged);
         var key = fullyCharged
             ? "full"
             : cableConnected
@@ -1249,6 +1715,7 @@ internal sealed class TrayAppContext : ApplicationContext
         if (string.Equals(_lastIconKey, key, StringComparison.Ordinal))
             return;
 
+        var previousKey = _lastIconKey;
         _lastIconKey = key;
         if (!_iconCache.TryGetValue(key, out var icon))
         {
@@ -1256,6 +1723,17 @@ internal sealed class TrayAppContext : ApplicationContext
             _iconCache[key] = icon;
         }
         _notifyIcon.Icon = icon;
+        _log.Write("info", "tray.icon_changed", nameof(TrayAppContext), "success", new
+        {
+            previous_icon = previousKey,
+            icon = key,
+            battery_bucket = batteryBucket,
+            cable_connected = cableConnected,
+            fully_charged = fullyCharged,
+            displayed_battery_percentage = _lastBatteryPercentage,
+            displayed_device = _lastReading == null ? null : _log.DeviceToken(_lastReading),
+            fact_basis = "application_icon_assignment"
+        }, reading: _lastReading);
     }
 
     private void SetDefaultIcon()
@@ -1263,8 +1741,15 @@ internal sealed class TrayAppContext : ApplicationContext
         if (string.Equals(_lastIconKey, "default", StringComparison.Ordinal))
             return;
 
+        var previousKey = _lastIconKey;
         _lastIconKey = "default";
         _notifyIcon.Icon = _appIcon;
+        _log.Write("info", "tray.icon_changed", nameof(TrayAppContext), "success", new
+        {
+            previous_icon = previousKey,
+            icon = "default",
+            reason = _lastFailureReason
+        });
     }
 
     private static Icon CreateBatteryIcon(int batteryBucket, bool cableConnected, bool fullyCharged)
@@ -1358,8 +1843,22 @@ internal sealed class TrayAppContext : ApplicationContext
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (disposing && Interlocked.Exchange(ref _isDisposing, 1) == 0)
         {
+            _log.Write("info", "tray.dispose_started", nameof(TrayAppContext), "success");
+            _shutdownCts.Cancel();
+            Interlocked.Exchange(ref _queuedCheck, 0);
+            lock (_deviceRefreshSync)
+            {
+                _deviceRefreshCts?.Cancel();
+                _deviceRefreshCts = null;
+                _deviceRefreshBurstStartedUtc = DateTime.MinValue;
+                _deviceRefreshForced = false;
+                _deviceRefreshTouchesTrackedDevice = false;
+                _deviceRefreshHasUntrackedDeviceEvent = false;
+                _deviceRefreshEvents.Clear();
+                _deviceRefreshBaselinePaths.Clear();
+            }
             _deviceChangeWindow.Dispose();
             _ui.Dispose();
             _pollTimer.Dispose();
@@ -1371,13 +1870,8 @@ internal sealed class TrayAppContext : ApplicationContext
                 icon.Dispose();
             _iconCache.Clear();
             _appIcon.Dispose();
-            lock (_deviceRefreshSync)
-            {
-                _deviceRefreshCts?.Cancel();
-                _deviceRefreshCts?.Dispose();
-                _deviceRefreshCts = null;
-            }
-            _checkGate.Dispose();
+            _log.Write("info", "tray.dispose_completed", nameof(TrayAppContext), "success");
+            _log.Flush(TimeSpan.FromSeconds(1));
         }
         base.Dispose(disposing);
     }
@@ -1406,50 +1900,63 @@ internal sealed class DeviceChangeWindow : NativeWindow, IDisposable
     private static Guid SessionDisplayStatusGuid = new("2B84C20E-AD23-4DDF-93DB-05FFBD7EFCA5");
     private readonly Action<string, bool> _onChange;
     private readonly Action<PowerBroadcastEvent> _onPowerEvent;
+    private readonly IAppEventLog _log;
     private IntPtr _notificationHandle;
     private IntPtr _powerNotificationHandle;
 
-    public DeviceChangeWindow(Action<string, bool> onChange, Action<PowerBroadcastEvent> onPowerEvent)
+    public DeviceChangeWindow(Action<string, bool> onChange, Action<PowerBroadcastEvent> onPowerEvent, IAppEventLog log)
     {
         _onChange = onChange;
         _onPowerEvent = onPowerEvent;
+        _log = log;
         CreateHandle(new CreateParams());
         RegisterHidNotifications();
         _powerNotificationHandle = RegisterPowerSettingNotification(Handle, ref SessionDisplayStatusGuid, DEVICE_NOTIFY_WINDOW_HANDLE);
+        _log.Write(_powerNotificationHandle == IntPtr.Zero ? "warn" : "info", "system.power_notification_registered", nameof(DeviceChangeWindow), _powerNotificationHandle == IntPtr.Zero ? "failure" : "success", new
+        {
+            win32_error = _powerNotificationHandle == IntPtr.Zero ? Marshal.GetLastWin32Error() : 0
+        });
     }
 
     protected override void WndProc(ref Message m)
     {
-        if (m.Msg == WM_DEVICECHANGE)
+        try
         {
-            var eventType = m.WParam.ToInt32();
-            if ((eventType == DBT_DEVICEARRIVAL || eventType == DBT_DEVICEREMOVECOMPLETE) && m.LParam != IntPtr.Zero)
+            if (m.Msg == WM_DEVICECHANGE)
             {
-                var header = Marshal.PtrToStructure<DevBroadcastHeader>(m.LParam);
-                if (header.DeviceType == DBT_DEVTYP_DEVICEINTERFACE)
+                var eventType = m.WParam.ToInt32();
+                if ((eventType == DBT_DEVICEARRIVAL || eventType == DBT_DEVICEREMOVECOMPLETE) && m.LParam != IntPtr.Zero)
                 {
-                    var namePtr = IntPtr.Add(m.LParam, 28);
-                    var path = Marshal.PtrToStringUni(namePtr) ?? string.Empty;
-                    _onChange(path, eventType == DBT_DEVICEARRIVAL);
+                    var header = Marshal.PtrToStructure<DevBroadcastHeader>(m.LParam);
+                    if (header.DeviceType == DBT_DEVTYP_DEVICEINTERFACE)
+                    {
+                        var namePtr = IntPtr.Add(m.LParam, 28);
+                        var path = Marshal.PtrToStringUni(namePtr) ?? string.Empty;
+                        _onChange(path, eventType == DBT_DEVICEARRIVAL);
+                    }
+                }
+            }
+            else if (m.Msg == WM_POWERBROADCAST)
+            {
+                var eventType = m.WParam.ToInt32();
+                if (eventType == PBT_APMSUSPEND)
+                    _onPowerEvent(PowerBroadcastEvent.Suspend);
+                else if (eventType == PBT_APMRESUMEAUTOMATIC)
+                    _onPowerEvent(PowerBroadcastEvent.Resume);
+                else if (eventType == PBT_POWERSETTINGCHANGE && m.LParam != IntPtr.Zero)
+                {
+                    var setting = Marshal.PtrToStructure<PowerBroadcastSetting>(m.LParam);
+                    if (setting.PowerSetting == SessionDisplayStatusGuid && setting.DataLength >= sizeof(int))
+                    {
+                        var value = Marshal.ReadInt32(m.LParam, Marshal.SizeOf<PowerBroadcastSetting>());
+                        _onPowerEvent(value == 0 ? PowerBroadcastEvent.DisplayOff : PowerBroadcastEvent.DisplayOn);
+                    }
                 }
             }
         }
-        else if (m.Msg == WM_POWERBROADCAST)
+        catch (Exception ex)
         {
-            var eventType = m.WParam.ToInt32();
-            if (eventType == PBT_APMSUSPEND)
-                _onPowerEvent(PowerBroadcastEvent.Suspend);
-            else if (eventType == PBT_APMRESUMEAUTOMATIC)
-                _onPowerEvent(PowerBroadcastEvent.Resume);
-            else if (eventType == PBT_POWERSETTINGCHANGE && m.LParam != IntPtr.Zero)
-            {
-                var setting = Marshal.PtrToStructure<PowerBroadcastSetting>(m.LParam);
-                if (setting.PowerSetting == SessionDisplayStatusGuid && setting.DataLength >= sizeof(int))
-                {
-                    var value = Marshal.ReadInt32(m.LParam, Marshal.SizeOf<PowerBroadcastSetting>());
-                    _onPowerEvent(value == 0 ? PowerBroadcastEvent.DisplayOff : PowerBroadcastEvent.DisplayOn);
-                }
-            }
+            _log.Write("warn", "system.window_message_decode_failed", nameof(DeviceChangeWindow), "failure", new { message_id = m.Msg }, ex);
         }
         base.WndProc(ref m);
     }
@@ -1458,12 +1965,20 @@ internal sealed class DeviceChangeWindow : NativeWindow, IDisposable
     {
         if (_notificationHandle != IntPtr.Zero)
         {
-            UnregisterDeviceNotification(_notificationHandle);
+            var succeeded = UnregisterDeviceNotification(_notificationHandle);
+            _log.Write(succeeded ? "debug" : "warn", "system.hid_notification_unregistered", nameof(DeviceChangeWindow), succeeded ? "success" : "failure", new
+            {
+                win32_error = succeeded ? 0 : Marshal.GetLastWin32Error()
+            });
             _notificationHandle = IntPtr.Zero;
         }
         if (_powerNotificationHandle != IntPtr.Zero)
         {
-            UnregisterPowerSettingNotification(_powerNotificationHandle);
+            var succeeded = UnregisterPowerSettingNotification(_powerNotificationHandle);
+            _log.Write(succeeded ? "debug" : "warn", "system.power_notification_unregistered", nameof(DeviceChangeWindow), succeeded ? "success" : "failure", new
+            {
+                win32_error = succeeded ? 0 : Marshal.GetLastWin32Error()
+            });
             _powerNotificationHandle = IntPtr.Zero;
         }
         DestroyHandle();
@@ -1479,6 +1994,10 @@ internal sealed class DeviceChangeWindow : NativeWindow, IDisposable
             ClassGuid = HidInterfaceGuid
         };
         _notificationHandle = RegisterDeviceNotification(Handle, ref filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+        _log.Write(_notificationHandle == IntPtr.Zero ? "warn" : "info", "system.hid_notification_registered", nameof(DeviceChangeWindow), _notificationHandle == IntPtr.Zero ? "failure" : "success", new
+        {
+            win32_error = _notificationHandle == IntPtr.Zero ? Marshal.GetLastWin32Error() : 0
+        });
     }
 
     [StructLayout(LayoutKind.Sequential)]

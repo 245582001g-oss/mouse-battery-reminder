@@ -9,6 +9,9 @@ internal sealed class CompxBatteryProvider : IBatteryProvider
     private const int PayloadLength = 16;
     private const int ReportLength = PayloadLength + 1;
     private const int IoTimeoutMs = 450;
+    private readonly IAppEventLog? _log;
+
+    public CompxBatteryProvider(IAppEventLog? log = null) => _log = log;
 
     public string Name => "ATK/COMPX HID";
     public int Priority => 250;
@@ -20,7 +23,7 @@ internal sealed class CompxBatteryProvider : IBatteryProvider
         return Task.Run(() => ReadAllOnce(inventory, token), token);
     }
 
-    private static ProviderReadResult ReadAllOnce(HidInventorySnapshot inventory, CancellationToken token)
+    private ProviderReadResult ReadAllOnce(HidInventorySnapshot inventory, CancellationToken token)
     {
         var devices = EnumerateCandidateDevices(inventory).ToArray();
         var readings = new List<BatteryReading>();
@@ -41,10 +44,13 @@ internal sealed class CompxBatteryProvider : IBatteryProvider
         };
     }
 
-    private static BatteryReading? TryReadDevice(HidDevice device)
+    private BatteryReading? TryReadDevice(HidDevice device)
     {
         if (!device.TryOpen(out var stream) || stream == null)
+        {
+            _log?.Write("warn", "provider.device_open_failed", Name, "failure", reading: DeviceForLog(device));
             return null;
+        }
 
         using (stream)
         {
@@ -54,6 +60,7 @@ internal sealed class CompxBatteryProvider : IBatteryProvider
                 stream.WriteTimeout = IoTimeoutMs;
 
                 var inputLength = Math.Max(ReportLength, SafeInt(device.GetMaxInputReportLength));
+                var rejectedFrames = 0;
                 foreach (var request in BuildRequests(device))
                 {
                     try
@@ -68,24 +75,52 @@ internal sealed class CompxBatteryProvider : IBatteryProvider
                             if (read <= 0)
                                 continue;
 
-                            var parsed = TryParseResponse(response, read);
-                            if (parsed != null)
-                                return EnrichReading(parsed, device);
+                             var parsed = TryParseResponse(response, read);
+                             if (parsed != null)
+                                 return EnrichReading(parsed, device);
+                            rejectedFrames++;
                         }
                     }
-                    catch
+                    catch (Exception ex)
                     {
+                        _log?.Write("warn", "provider.io_failed", Name, "failure", new
+                        {
+                            operation = "write_read",
+                            request_variant = request.Name,
+                            request_length = request.Bytes.Length,
+                            timeout_ms = IoTimeoutMs
+                        }, ex, DeviceForLog(device));
                     }
                 }
+                _log?.Write("warn", "provider.read_timeout", Name, "failure", new
+                {
+                    timeout_ms = IoTimeoutMs,
+                    rejected_frame_count = rejectedFrames,
+                    input_report_length = inputLength
+                }, reading: DeviceForLog(device));
             }
-            catch
+            catch (Exception ex)
             {
+                _log?.Write("warn", "provider.io_failed", Name, "failure", new
+                {
+                    operation = "prepare_stream",
+                    timeout_ms = IoTimeoutMs
+                }, ex, DeviceForLog(device));
                 return null;
             }
         }
 
         return null;
     }
+
+    private static BatteryReading DeviceForLog(HidDevice device) => new()
+    {
+        HasBatteryPercentage = false,
+        DeviceId = Safe(() => device.DevicePath),
+        VendorId = $"0x{device.VendorID:X4}",
+        ProductId = $"0x{device.ProductID:X4}",
+        Source = "ATK/COMPX HID"
+    };
 
     private static BatteryReading? TryParseResponse(byte[] response, int length)
     {

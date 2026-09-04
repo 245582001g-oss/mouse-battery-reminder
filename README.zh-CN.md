@@ -123,6 +123,34 @@ NinjutsoSoraOfficialProvider
 
 程序优先使用已验证的内置官方协议。本地学习 profile 适合暂时不值得写成内置 provider 的未知设备，但优先级更低，未来可以被内置 provider 替代。
 
+## 飞行记录器 DEBUG 日志
+
+程序默认开启结构化“飞行记录器”，专门处理事后很难用语言复述的问题。一次检测从 HID 枚举、各 provider 读取、设备状态合并、历史写入、提醒判断、轮询策略，一直到托盘文字和图标变化，都能用同一个操作编号串起来。
+
+实时日志文件：
+
+```text
+%USERPROFILE%\Documents\SoraV2BatteryTip\logs\flight-current.jsonl
+```
+
+软件运行中也可以直接读取：
+
+```powershell
+Get-Content "$env:USERPROFILE\Documents\SoraV2BatteryTip\logs\flight-current.jsonl" -Wait
+```
+
+每条 JSONL 记录都有 UTC 时间、本地时间、单调运行时间、当前运行序号、运行 ID 和检测操作 ID。主要事件包括：
+
+- HID/USB 设备插入与移除、睡眠/恢复、息屏/亮屏。
+- provider 候选、读取、超时、解析拒绝、重试与恢复。
+- 电量变化、插线、拔线、开始充电、停止充电、满电、数据过期、恢复和离线。
+- 低电量提醒判断、提示音、轮询间隔变化，以及每一次托盘图标变化。
+- 设置、profile 工具、诊断导出、正常退出和未处理崩溃。
+
+这是本机事实优先的诊断日志：设备记录同时包含稳定关联 token，以及原始设备名称、HID 路径和序列号；异常记录包含真实错误消息，便于直接定位问题。它不额外记录 provider 的 HID 请求/响应 payload。日志在达到 4 MiB 或跨 UTC 日期时轮转，最多保留 14 天、12 个归档且总计不超过 32 MiB。右键托盘图标选择“打开 DEBUG 日志目录”即可进入。诊断包会保留本机状态、设置、profile、HID 清单、电量历史和限量日志快照；如要发给别人，请先自行检查内容。
+
+完整事件表与“直接事实 / 推导事实”说明见 [docs/DEBUG-FLIGHT-RECORDER.zh-CN.md](docs/DEBUG-FLIGHT-RECORDER.zh-CN.md)。
+
 ## 数据目录
 
 ```text
@@ -135,7 +163,8 @@ NinjutsoSoraOfficialProvider
 - `status.json`
 - `sounds\*.wav`
 - `profiles\*.json`
-- 电量历史和诊断导出
+- `logs\flight-current.jsonl` 与轮转后的飞行记录器日志
+- 电量历史与本机完整事实诊断导出
 
 ## 编译
 
@@ -143,6 +172,12 @@ NinjutsoSoraOfficialProvider
 
 ```powershell
 dotnet publish .\src\SoraV2BatteryTip\SoraV2BatteryTip.csproj -c Release -r win-x64 --self-contained false -o .\releases\latest
+```
+
+运行不依赖第三方测试框架的回归自测：
+
+```powershell
+dotnet run --project .\tests\SoraV2BatteryTip.SelfTest\SoraV2BatteryTip.SelfTest.csproj -c Release
 ```
 
 运行：

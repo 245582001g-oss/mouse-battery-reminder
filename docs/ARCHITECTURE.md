@@ -123,6 +123,22 @@ NinjutsoSoraOfficialProvider
 
 The app prefers verified built-in protocols first. Local learned profiles are useful for unsupported devices, but they are lower priority and can be replaced by built-in providers later.
 
+### State and diagnostics pipeline
+
+```text
+Windows device/power notifications
+-> HidDeviceInventory (reliable snapshot cache; short retry TTL for failures)
+-> BatteryProviderManager (parallel provider reads and per-device deduplication)
+-> DeviceBatteryStateStore (multi-device merge, transient-failure retention, offline/rekey transitions)
+-> DevicePowerSemantics (one definition of external power, charging, and full charge)
+-> BatteryHistoryStore / LowBatteryAlertTracker / ChargingPollingPolicy
+-> TrayAppContext (status text, sound, polling timer, and actual icon assignment)
+```
+
+Every important branch also emits a structured event to `FlightRecorder`. The recorder owns its background writer; business code never writes the log file directly. Events from one poll share an `op_id`; each device carries both a stable correlation token and its original name/path/serial, so Windows notifications, actual provider reads, derived state transitions, alert decisions, and icon assignments can be reconstructed directly.
+
+When a device's runtime identity changes—such as a new path after reconnection or a placeholder serial being promoted to a real serial—the state store emits an explicit identity transition. Alert and charging-policy state move with it so one physical mouse is not treated as a new device.
+
 ## Data directory
 
 ```text
