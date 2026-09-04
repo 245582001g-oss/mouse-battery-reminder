@@ -1,10 +1,24 @@
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 
 namespace SoraV2BatteryTip;
 
 internal sealed class TrayAppContext : ApplicationContext
 {
+    private const int ChargingPollingIntervalMilliseconds = 10_000;
+    private const int SteadyChargingPollingIntervalMilliseconds = 60_000;
+    private const int FullChargePollingIntervalMilliseconds = 5 * 60 * 1000;
+    private static readonly TimeSpan ChargingFastWindow = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan DeviceChangeQuietPeriod = TimeSpan.FromMilliseconds(200);
+    private static readonly TimeSpan DeviceChangeMaximumCoalesce = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan[] DeviceReadRetryDelays =
+    {
+        TimeSpan.Zero,
+        TimeSpan.FromMilliseconds(250),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromSeconds(1)
+    };
     private readonly AppPaths _paths;
     private readonly SettingsStore _settingsStore;
     private readonly Localizer _text;
@@ -13,6 +27,8 @@ internal sealed class TrayAppContext : ApplicationContext
     private readonly DiagnosticsExporter _diagnostics;
     private readonly BatteryCandidateCollector _candidateCollector;
     private readonly ProfileDraftImporter _draftImporter;
+    private readonly HidDeviceInventory _hidInventory;
+    private readonly DeviceBatteryStateStore _deviceStates = new();
     private readonly KnownDeviceProfileProvider _profileProvider;
     private readonly BatteryProviderManager _providerManager;
     private readonly NotifyIcon _notifyIcon;
@@ -20,27 +36,39 @@ internal sealed class TrayAppContext : ApplicationContext
     private readonly System.Windows.Forms.Timer _pollTimer;
     private readonly DeviceChangeWindow _deviceChangeWindow;
     private readonly Control _ui;
+    private readonly Icon _appIcon;
+    private readonly Dictionary<string, Icon> _iconCache = new(StringComparer.Ordinal);
+    private readonly object _deviceRefreshSync = new();
     private readonly SemaphoreSlim _checkGate = new(1, 1);
+    private readonly Dictionary<string, int> _lastAlertedBatteryLevels = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTime> _lastAlertUtcByDevice = new(StringComparer.OrdinalIgnoreCase);
 
     private AppSettings _settings;
     private BatteryReading? _lastReading;
     private IReadOnlyList<BatteryReading> _lastReadings = Array.Empty<BatteryReading>();
     private BatteryHistoryWindow? _historyWindow;
-    private Icon? _dynamicIcon;
+    private CancellationTokenSource? _deviceRefreshCts;
     private ToolStripMenuItem? _statusItem;
+    private ToolStripMenuItem? _lastCheckItem;
     private string _statusText = "Mouse Battery Reminder: not detected";
     private string? _lastTrayText;
     private string? _lastIconKey;
     private int? _lastBatteryPercentage;
     private int? _lastBatteryBucket;
+    private int _activePollingIntervalMilliseconds;
+    private int _queuedCheck;
     private bool _isDetected;
     private bool _isCableConnected;
     private bool _keepSoundMenuOpen;
-    private DateTime _lastAlertUtc = DateTime.MinValue;
+    private bool _displayActive = true;
     private DateTime? _lastCheckLocal;
-    private int? _lastAlertedBatteryLevel;
+    private DateTime _chargingFastUntilUtc = DateTime.MinValue;
+    private DateTime _deviceRefreshBurstStartedUtc = DateTime.MinValue;
+    private string _lastHidPresenceSignature = "";
     private string _lastSource = "none";
     private string _lastFailureReason = "not_detected";
+    private bool _deviceRefreshForced;
+    private bool _deviceRefreshTouchesTrackedDevice;
 
     public TrayAppContext()
     {
@@ -52,21 +80,27 @@ internal sealed class TrayAppContext : ApplicationContext
         _sound = new AlertSoundService(_paths, () => _settings);
         _history = new BatteryHistoryStore(_paths);
         _diagnostics = new DiagnosticsExporter(_paths, () => _settings, CreateDiagnosticsState);
-        _profileProvider = new KnownDeviceProfileProvider(_paths);
+        _hidInventory = new HidDeviceInventory();
+        _profileProvider = new KnownDeviceProfileProvider(_paths, _hidInventory);
         _candidateCollector = new BatteryCandidateCollector(_paths);
         _draftImporter = new ProfileDraftImporter(_paths, _profileProvider);
-        _providerManager = new BatteryProviderManager(new IBatteryProvider[] { new NinjutsoSoraOfficialProvider(), new CompxBatteryProvider(), _profileProvider });
+        _providerManager = new BatteryProviderManager(_hidInventory, new IBatteryProvider[] { new NinjutsoSoraOfficialProvider(), new CompxBatteryProvider(), _profileProvider });
 
         if (_settings.StartupWithWindows)
             StartupManager.SetEnabled(true);
 
         _menu = new ContextMenuStrip { Font = new Font("Microsoft YaHei UI", 9F) };
         _menu.Closing += KeepSoundMenuOpenWhenPreviewing;
-        BuildMenu();
+        _menu.Opening += (_, _) => BuildMenu();
+        _menu.Closed += (_, _) =>
+        {
+            _keepSoundMenuOpen = false;
+        };
 
+        _appIcon = LoadAppIcon();
         _notifyIcon = new NotifyIcon
         {
-            Icon = LoadAppIcon(),
+            Icon = _appIcon,
             Text = _text["AppName"],
             Visible = true,
             ContextMenuStrip = _menu
@@ -75,8 +109,6 @@ internal sealed class TrayAppContext : ApplicationContext
         {
             if (e.Button == MouseButtons.Left)
                 await CheckNowAsync(clearOnMissing: true, updateUi: true);
-            else if (e.Button == MouseButtons.Right)
-                BuildMenu();
         };
 
         _pollTimer = new System.Windows.Forms.Timer();
@@ -84,7 +116,10 @@ internal sealed class TrayAppContext : ApplicationContext
 
         _ui = new Control();
         _ui.CreateControl();
-        _deviceChangeWindow = new DeviceChangeWindow(OnDeviceChanged);
+        _deviceChangeWindow = new DeviceChangeWindow(OnDeviceChanged, OnPowerEvent);
+        var initialInventory = _hidInventory.GetSnapshot();
+        if (initialInventory.IsReliable)
+            _lastHidPresenceSignature = initialInventory.CreatePresenceSignature();
 
         ApplyTimerInterval();
         _ = CheckNowAsync(clearOnMissing: true, updateUi: true);
@@ -92,6 +127,10 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private void BuildMenu()
     {
+        if (_menu.IsDisposed || _menu.Visible)
+            return;
+
+        _keepSoundMenuOpen = false;
         _menu.Items.Clear();
         _statusItem = new ToolStripMenuItem(_statusText) { Enabled = false, ForeColor = _isCableConnected ? Color.ForestGreen : SystemColors.ControlText };
         _menu.Items.Add(_statusItem);
@@ -108,7 +147,8 @@ internal sealed class TrayAppContext : ApplicationContext
         _menu.Items.Add(new ToolStripMenuItem(_text["TestSound"], null, (_, _) => _sound.PlayCurrent()));
         _menu.Items.Add(BuildDeviceProfilesMenu());
         _menu.Items.Add(new ToolStripSeparator());
-        _menu.Items.Add(new ToolStripMenuItem($"{_text["LastCheck"]}: {(_lastCheckLocal.HasValue ? _lastCheckLocal.Value.ToString("HH:mm:ss") : _text["Never"])}") { Enabled = false });
+        _lastCheckItem = new ToolStripMenuItem($"{_text["LastCheck"]}: {(_lastCheckLocal.HasValue ? _lastCheckLocal.Value.ToString("HH:mm:ss") : _text["Never"])}") { Enabled = false };
+        _menu.Items.Add(_lastCheckItem);
         _menu.Items.Add(new ToolStripMenuItem($"{_text["Source"]}: {_lastSource}") { Enabled = false });
         if (!string.IsNullOrWhiteSpace(_lastFailureReason))
             _menu.Items.Add(new ToolStripMenuItem($"{_text["FailureReason"]}: {LocalizeFailure(_lastFailureReason)}") { Enabled = false });
@@ -167,7 +207,7 @@ internal sealed class TrayAppContext : ApplicationContext
         _profileProvider.ReloadProfiles();
         try { _notifyIcon.ShowBalloonTip(1800, _text["DeviceProfiles"], _text["ProfilesReloaded"], ToolTipIcon.Info); }
         catch { }
-        BuildMenu();
+        RequestMenuRebuild();
     }
 
     private void ImportLatestDrafts()
@@ -179,7 +219,7 @@ internal sealed class TrayAppContext : ApplicationContext
             : $"{_text[result.MessageKey]}: {result.Imported}/{result.Total}, rejected: {result.Rejected}";
         try { _notifyIcon.ShowBalloonTip(3000, _text["DeviceProfiles"], message, result.Imported > 0 ? ToolTipIcon.Info : ToolTipIcon.Warning); }
         catch { }
-        BuildMenu();
+        RequestMenuRebuild();
     }
 
     private async Task AutoSetupUnknownMouse()
@@ -192,8 +232,14 @@ internal sealed class TrayAppContext : ApplicationContext
         try
         {
             SetStatusText(_text["AutoSetupRunning"]);
-            dir = _candidateCollector.Collect(officialBattery.Value);
-            var result = _draftImporter.ImportVerifiedDraftsProgressive(dir);
+            var setup = await Task.Run(() =>
+            {
+                var candidateDirectory = _candidateCollector.Collect(officialBattery.Value);
+                var importResult = _draftImporter.ImportVerifiedDraftsProgressive(candidateDirectory);
+                return (candidateDirectory, importResult);
+            });
+            dir = setup.candidateDirectory;
+            var result = setup.importResult;
             _profileProvider.ReloadProfiles();
 
             if (result.Imported > 0)
@@ -222,7 +268,7 @@ internal sealed class TrayAppContext : ApplicationContext
         }
         finally
         {
-            BuildMenu();
+            RequestMenuRebuild();
         }
     }
 
@@ -327,6 +373,13 @@ internal sealed class TrayAppContext : ApplicationContext
         _settingsStore.Save(_settings);
         ApplyTimerInterval();
         RenderTrayState();
+        RequestMenuRebuild();
+    }
+
+    private void RequestMenuRebuild()
+    {
+        if (!_menu.IsDisposed && _menu.Visible)
+            _menu.Invalidate();
     }
 
     private void ShowBatteryHistoryWindow()
@@ -376,54 +429,88 @@ internal sealed class TrayAppContext : ApplicationContext
         processId = Environment.ProcessId
     };
 
-    private async Task<bool> CheckNowAsync(bool clearOnMissing, bool updateUi)
+    private async Task<bool> CheckNowAsync(
+        bool clearOnMissing,
+        bool updateUi,
+        CancellationToken cancellationToken = default,
+        bool preserveStateOnFailure = false,
+        bool waitForGate = false)
     {
-        if (!await _checkGate.WaitAsync(0))
+        cancellationToken.ThrowIfCancellationRequested();
+        if (waitForGate)
+        {
+            await _checkGate.WaitAsync(cancellationToken);
+        }
+        else if (!await _checkGate.WaitAsync(0, cancellationToken))
+        {
+            Interlocked.Exchange(ref _queuedCheck, 1);
             return false;
+        }
 
         try
         {
-            if (updateUi)
+            cancellationToken.ThrowIfCancellationRequested();
+            var previousStateKey = CreateReadingStateKey(_lastReadings, _lastSource, _lastFailureReason);
+            if (updateUi && !preserveStateOnFailure)
                 SetStatusText(_text["Checking"]);
 
-            var result = await _providerManager.ReadAllAsync(CancellationToken.None);
-            _lastCheckLocal = DateTime.Now;
-            _lastSource = result.Source;
-            _lastFailureReason = result.FailureReason;
+            var result = await _providerManager.ReadAllAsync(cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (preserveStateOnFailure
+                && (result.Readings.Count == 0 || !PreviousReadingsCoveredBy(_lastReadings, result.Readings)))
+                return false;
 
-            if (result.Readings.Count > 0)
+            _lastCheckLocal = DateTime.Now;
+            if (_lastCheckItem is { IsDisposed: false })
+                _lastCheckItem.Text = $"{_text["LastCheck"]}: {_lastCheckLocal.Value:HH:mm:ss}";
+
+            var stateUpdate = _deviceStates.Apply(result, DateTime.UtcNow, CurrentStaleThreshold());
+            foreach (var reading in stateUpdate.OfflineReadings)
+                _history.MarkOffline(reading);
+
+            if (stateUpdate.CurrentReadings.Count > 0)
             {
-                ApplyReadings(result.Readings);
-                foreach (var reading in result.Readings)
-                    _history.Append("detected", reading);
+                _lastSource = string.Join(", ", stateUpdate.CurrentReadings.Select(reading => reading.Source).Distinct(StringComparer.OrdinalIgnoreCase));
+                _lastFailureReason = stateUpdate.HasFreshSamples ? "" : "read_failed";
+                ApplyReadings(stateUpdate.CurrentReadings);
+                ApplyTimerInterval();
+                foreach (var reading in stateUpdate.FreshReadings)
+                    _history.Append(reading);
                 if (updateUi)
                     RenderTrayState();
-                var alertReading = SelectAlertReading(result.Readings);
+                var alertReading = SelectAlertReading(stateUpdate.FreshReadings);
                 if (alertReading != null)
                     MaybePlayAlert(alertReading);
-                return true;
+                if (!string.Equals(previousStateKey, CreateReadingStateKey(_lastReadings, _lastSource, _lastFailureReason), StringComparison.Ordinal))
+                    RequestMenuRebuild();
+                return stateUpdate.HasFreshSamples;
             }
 
+            _lastSource = result.Source;
+            _lastFailureReason = result.FailureReason;
             ApplyMissingReading(clearOnMissing);
+            ApplyTimerInterval();
             if (updateUi)
                 RenderTrayState();
+            if (!string.Equals(previousStateKey, CreateReadingStateKey(_lastReadings, _lastSource, _lastFailureReason), StringComparison.Ordinal))
+                RequestMenuRebuild();
             return false;
         }
         finally
         {
             _checkGate.Release();
+            if (Interlocked.Exchange(ref _queuedCheck, 0) == 1)
+                _ = CheckNowAsync(clearOnMissing: true, updateUi: true);
         }
-    }
-
-    private void ApplyReading(BatteryReading reading)
-    {
-        ApplyReadings(new[] { reading });
     }
 
     private void ApplyReadings(IReadOnlyList<BatteryReading> readings)
     {
         var validReadings = readings
-            .Where(reading => reading.HasBatteryPercentage && reading.BatteryPercentage is >= 1 and <= 100)
+            .Where(reading => reading.HasBatteryPercentage
+                && reading.BatteryPercentage is >= 1 and <= 100
+                && reading.IsOnline
+                && reading.PowerState != DevicePowerState.Offline)
             .OrderBy(reading => reading.BatteryPercentage)
             .ThenBy(reading => ShortDeviceName(reading))
             .ToArray();
@@ -434,41 +521,44 @@ internal sealed class TrayAppContext : ApplicationContext
             return;
         }
 
+        var wasCharging = _isCableConnected;
         var iconReading = SelectIconReading(validReadings);
         _lastReadings = validReadings;
         _lastReading = iconReading;
         _isDetected = true;
         _isCableConnected = validReadings.All(IsReadingCharging);
+        if (!wasCharging && _isCableConnected)
+            _chargingFastUntilUtc = DateTime.UtcNow.Add(ChargingFastWindow);
+        else if (wasCharging && !_isCableConnected)
+            _chargingFastUntilUtc = DateTime.MinValue;
         _lastBatteryPercentage = iconReading.BatteryPercentage;
         _lastBatteryBucket = ToBatteryBucket(iconReading.BatteryPercentage);
     }
 
     private void ApplyMissingReading(bool clearOnMissing)
     {
-        var connection = default(DeviceConnection);
-        _isCableConnected = connection.IsCableConnected;
-        _isDetected = connection.IsDetected || (!clearOnMissing && _lastBatteryBucket.HasValue);
-
-        if (!_isDetected)
+        if (_lastFailureReason == "read_failed" && _lastReading != null)
         {
-            _lastReadings = Array.Empty<BatteryReading>();
-            _lastReading = null;
+            _isDetected = true;
+            _isCableConnected = IsReadingCharging(_lastReading);
+            if (_lastReadings.Count == 0)
+                _lastReadings = new[] { _lastReading };
             return;
         }
 
-        if (_lastReading != null)
+        if (!clearOnMissing && _lastReading != null)
         {
-            _lastReading = new BatteryReading
-            {
-                BatteryPercentage = _lastBatteryPercentage ?? _lastReading.BatteryPercentage,
-                IsCharging = false,
-                IsFullyCharged = false,
-                IsOnline = connection.WirelessPresent,
-                IsCableConnected = connection.IsCableConnected,
-                Source = _lastReading.Source
-            };
-            _lastReadings = new[] { _lastReading };
+            _isDetected = true;
+            return;
         }
+
+        _isDetected = false;
+        _isCableConnected = false;
+        _lastReadings = Array.Empty<BatteryReading>();
+        _lastReading = null;
+        _lastBatteryPercentage = null;
+        _lastBatteryBucket = null;
+        _chargingFastUntilUtc = DateTime.MinValue;
     }
 
     private void OnDeviceChanged(string devicePath, bool arrived)
@@ -477,7 +567,276 @@ internal sealed class TrayAppContext : ApplicationContext
             return;
 
         if (devicePath.Contains("hid#", StringComparison.OrdinalIgnoreCase))
-            _ = CheckNowAsync(clearOnMissing: true, updateUi: true);
+        {
+            _hidInventory.Invalidate();
+            ScheduleRefreshAfterChange(devicePath);
+        }
+    }
+
+    private void ScheduleRefreshAfterChange(
+        string? devicePath = null,
+        bool forceRefresh = false,
+        TimeSpan? quietPeriod = null)
+    {
+        CancellationTokenSource current;
+        TimeSpan delay;
+        bool touchesTrackedDevice;
+        bool forced;
+        lock (_deviceRefreshSync)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (_deviceRefreshCts == null || _deviceRefreshBurstStartedUtc == DateTime.MinValue)
+                _deviceRefreshBurstStartedUtc = nowUtc;
+
+            _deviceRefreshForced |= forceRefresh;
+            _deviceRefreshTouchesTrackedDevice |= !string.IsNullOrWhiteSpace(devicePath) && IsTrackedDevicePath(devicePath);
+
+            var requestedDelay = quietPeriod ?? DeviceChangeQuietPeriod;
+            var remaining = DeviceChangeMaximumCoalesce - (nowUtc - _deviceRefreshBurstStartedUtc);
+            delay = remaining <= TimeSpan.Zero
+                ? TimeSpan.Zero
+                : requestedDelay <= remaining
+                    ? requestedDelay
+                    : remaining;
+
+            _deviceRefreshCts?.Cancel();
+            _deviceRefreshCts = new CancellationTokenSource();
+            current = _deviceRefreshCts;
+            touchesTrackedDevice = _deviceRefreshTouchesTrackedDevice;
+            forced = _deviceRefreshForced;
+        }
+        _ = RefreshAfterDeviceChangeAsync(delay, current, forced, touchesTrackedDevice);
+    }
+
+    private async Task RefreshAfterDeviceChangeAsync(
+        TimeSpan delay,
+        CancellationTokenSource owner,
+        bool forceRefresh,
+        bool touchesTrackedDevice)
+    {
+        try
+        {
+            await Task.Delay(delay, owner.Token).ConfigureAwait(false);
+            owner.Token.ThrowIfCancellationRequested();
+
+            var snapshot = _hidInventory.GetSnapshot();
+            var signature = snapshot.IsReliable ? snapshot.CreatePresenceSignature() : string.Empty;
+            string previousSignature;
+            lock (_deviceRefreshSync)
+                previousSignature = _lastHidPresenceSignature;
+
+            var signatureChanged = !snapshot.IsReliable
+                || !string.Equals(previousSignature, signature, StringComparison.OrdinalIgnoreCase);
+            if (!forceRefresh && !touchesTrackedDevice && !signatureChanged)
+                return;
+
+            for (var attempt = 0; attempt < DeviceReadRetryDelays.Length; attempt++)
+            {
+                var retryDelay = DeviceReadRetryDelays[attempt];
+                if (retryDelay > TimeSpan.Zero)
+                {
+                    await Task.Delay(retryDelay, owner.Token).ConfigureAwait(false);
+                    _hidInventory.Invalidate();
+                    snapshot = _hidInventory.GetSnapshot();
+                    if (snapshot.IsReliable)
+                        signature = snapshot.CreatePresenceSignature();
+                }
+
+                owner.Token.ThrowIfCancellationRequested();
+                var finalAttempt = attempt == DeviceReadRetryDelays.Length - 1;
+                var succeeded = await InvokeDeviceCheckAsync(finalAttempt, owner.Token).ConfigureAwait(false);
+                if (succeeded)
+                {
+                    CommitHidPresenceSignature(snapshot, signature);
+                    return;
+                }
+            }
+
+            CommitHidPresenceSignature(snapshot, signature);
+        }
+        catch (OperationCanceledException) { }
+        catch { }
+        finally
+        {
+            lock (_deviceRefreshSync)
+            {
+                if (ReferenceEquals(_deviceRefreshCts, owner))
+                {
+                    _deviceRefreshCts = null;
+                    _deviceRefreshBurstStartedUtc = DateTime.MinValue;
+                    _deviceRefreshForced = false;
+                    _deviceRefreshTouchesTrackedDevice = false;
+                }
+            }
+            owner.Dispose();
+        }
+    }
+
+    private Task<bool> InvokeDeviceCheckAsync(bool finalAttempt, CancellationToken token)
+    {
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (token.IsCancellationRequested)
+        {
+            completion.TrySetCanceled(token);
+            return completion.Task;
+        }
+        if (_ui.IsDisposed || !_ui.IsHandleCreated)
+        {
+            completion.TrySetResult(false);
+            return completion.Task;
+        }
+
+        try
+        {
+            _ui.BeginInvoke((MethodInvoker)(async () =>
+            {
+                try
+                {
+                    token.ThrowIfCancellationRequested();
+                    var result = await CheckNowAsync(
+                        clearOnMissing: finalAttempt,
+                        updateUi: true,
+                        cancellationToken: token,
+                        preserveStateOnFailure: !finalAttempt,
+                        waitForGate: true);
+                    completion.TrySetResult(result);
+                }
+                catch (OperationCanceledException)
+                {
+                    completion.TrySetCanceled(token);
+                }
+                catch
+                {
+                    completion.TrySetResult(false);
+                }
+            }));
+        }
+        catch
+        {
+            completion.TrySetResult(false);
+        }
+
+        return completion.Task;
+    }
+
+    private void CommitHidPresenceSignature(HidInventorySnapshot snapshot, string signature)
+    {
+        if (!snapshot.IsReliable)
+            return;
+
+        lock (_deviceRefreshSync)
+            _lastHidPresenceSignature = signature;
+    }
+
+    private bool IsTrackedDevicePath(string devicePath)
+    {
+        foreach (var reading in _lastReadings)
+        {
+            if (!string.IsNullOrWhiteSpace(reading.DeviceId)
+                && string.Equals(reading.DeviceId, devicePath, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            var vendorId = NormalizeUsbIdentifier(reading.VendorId);
+            var productId = NormalizeUsbIdentifier(reading.ProductId);
+            if (vendorId != null
+                && productId != null
+                && devicePath.Contains($"vid_{vendorId}", StringComparison.OrdinalIgnoreCase)
+                && devicePath.Contains($"pid_{productId}", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static string? NormalizeUsbIdentifier(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        var normalized = value.Trim();
+        if (normalized.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            normalized = normalized[2..];
+        if (!int.TryParse(normalized, System.Globalization.NumberStyles.HexNumber, null, out var parsed))
+            return null;
+        return parsed.ToString("X4");
+    }
+
+    private static bool PreviousReadingsCoveredBy(
+        IReadOnlyList<BatteryReading> previousReadings,
+        IReadOnlyList<BatteryReading> currentReadings)
+    {
+        if (previousReadings.Count == 0)
+            return currentReadings.Count > 0;
+
+        return previousReadings.All(previous => currentReadings.Any(current => IsSamePhysicalDevice(previous, current)));
+    }
+
+    private static bool IsSamePhysicalDevice(BatteryReading previous, BatteryReading current)
+    {
+        if (!string.IsNullOrWhiteSpace(previous.DeviceId)
+            && string.Equals(previous.DeviceId, current.DeviceId, StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (!string.Equals(previous.VendorId, current.VendorId, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(previous.Source, current.Source, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var previousSerial = NormalizeDeviceSerial(previous.DeviceSerial);
+        var currentSerial = NormalizeDeviceSerial(current.DeviceSerial);
+        if (previousSerial != null && currentSerial != null)
+            return string.Equals(previousSerial, currentSerial, StringComparison.OrdinalIgnoreCase);
+
+        return !string.IsNullOrWhiteSpace(previous.DeviceName)
+            && string.Equals(previous.DeviceName.Trim(), current.DeviceName.Trim(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? NormalizeDeviceSerial(string? serial)
+    {
+        if (string.IsNullOrWhiteSpace(serial))
+            return null;
+
+        var normalized = serial.Trim();
+        return normalized.All(character => character is '0' or '-' or ' ')
+            ? null
+            : normalized;
+    }
+
+    private void CancelPendingDeviceRefresh()
+    {
+        lock (_deviceRefreshSync)
+        {
+            _deviceRefreshCts?.Cancel();
+            _deviceRefreshCts = null;
+            _deviceRefreshBurstStartedUtc = DateTime.MinValue;
+            _deviceRefreshForced = false;
+            _deviceRefreshTouchesTrackedDevice = false;
+        }
+    }
+
+    private void OnPowerEvent(PowerBroadcastEvent powerEvent)
+    {
+        switch (powerEvent)
+        {
+            case PowerBroadcastEvent.Suspend:
+                _pollTimer.Stop();
+                CancelPendingDeviceRefresh();
+                break;
+            case PowerBroadcastEvent.Resume:
+                _displayActive = true;
+                _hidInventory.Invalidate();
+                ScheduleRefreshAfterChange(forceRefresh: true, quietPeriod: TimeSpan.FromMilliseconds(300));
+                break;
+            case PowerBroadcastEvent.DisplayOff:
+                _displayActive = false;
+                ApplyTimerInterval();
+                break;
+            case PowerBroadcastEvent.DisplayOn:
+                var wasInactive = !_displayActive;
+                _displayActive = true;
+                ApplyTimerInterval();
+                if (wasInactive)
+                    ScheduleRefreshAfterChange(forceRefresh: true, quietPeriod: DeviceChangeQuietPeriod);
+                break;
+        }
     }
 
     private void RenderTrayState()
@@ -488,18 +847,18 @@ internal sealed class TrayAppContext : ApplicationContext
             return;
         }
 
-        if (_lastFailureReason == "read_failed" && _lastBatteryPercentage.HasValue)
+        if (_lastReadings.Count > 1)
         {
-            var text = $"{_text["AppName"]}: {_lastBatteryPercentage.Value}% ({LocalizeFailure(_lastFailureReason)})";
+            var text = $"{MouseCountLabel(_lastReadings.Count)}: {string.Join(" / ", _lastReadings.Select(FormatCompactReading))}";
             SetStatusText(text);
             SetTrayText(TrimTrayText(text));
             UpdateIcon(cableConnected: _isCableConnected, batteryBucket: _lastBatteryBucket ?? 100);
             return;
         }
 
-        if (_lastReadings.Count > 1)
+        if (_lastFailureReason == "read_failed" && _lastBatteryPercentage.HasValue)
         {
-            var text = $"{MouseCountLabel(_lastReadings.Count)}: {string.Join(" / ", _lastReadings.Select(FormatCompactReading))}";
+            var text = $"{_text["AppName"]}: {_lastBatteryPercentage.Value}% ({LocalizeFailure(_lastFailureReason)})";
             SetStatusText(text);
             SetTrayText(TrimTrayText(text));
             UpdateIcon(cableConnected: _isCableConnected, batteryBucket: _lastBatteryBucket ?? 100);
@@ -559,36 +918,32 @@ internal sealed class TrayAppContext : ApplicationContext
         _notifyIcon.Text = text;
     }
 
-    private void PostRenderTrayState()
-    {
-        try
-        {
-            if (!_ui.IsDisposed && _ui.IsHandleCreated)
-                _ui.BeginInvoke(RenderTrayState);
-        }
-        catch { }
-    }
-
     private void MaybePlayAlert(BatteryReading reading)
     {
         if (!reading.HasBatteryPercentage || reading.BatteryPercentage <= 0)
             return;
 
+        var deviceKey = string.IsNullOrWhiteSpace(reading.DeviceId)
+            ? $"{reading.VendorId}:{reading.ProductId}:{reading.Source}"
+            : reading.DeviceId;
+
         if (reading.IsCableConnected || reading.IsCharging || reading.IsFullyCharged || reading.BatteryPercentage > _settings.AlertThreshold)
         {
-            _lastAlertedBatteryLevel = null;
+            _lastAlertedBatteryLevels.Remove(deviceKey);
+            _lastAlertUtcByDevice.Remove(deviceKey);
             return;
         }
 
         var alertLevel = AlertLevelFor(reading.BatteryPercentage);
-        if (_lastAlertedBatteryLevel.HasValue && alertLevel >= _lastAlertedBatteryLevel.Value)
+        if (_lastAlertedBatteryLevels.TryGetValue(deviceKey, out var lastAlertedLevel) && alertLevel >= lastAlertedLevel)
             return;
 
-        if (_lastAlertUtc != DateTime.MinValue && DateTime.UtcNow < _lastAlertUtc.AddMinutes(_settings.AlertCooldownMinutes))
+        if (_lastAlertUtcByDevice.TryGetValue(deviceKey, out var lastAlertUtc)
+            && DateTime.UtcNow < lastAlertUtc.AddMinutes(_settings.AlertCooldownMinutes))
             return;
 
-        _lastAlertUtc = DateTime.UtcNow;
-        _lastAlertedBatteryLevel = alertLevel;
+        _lastAlertUtcByDevice[deviceKey] = DateTime.UtcNow;
+        _lastAlertedBatteryLevels[deviceKey] = alertLevel;
         _sound.PlayCurrent();
     }
 
@@ -596,24 +951,44 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private void ApplyTimerInterval()
     {
+        var chargingReadings = _lastReadings.Where(IsReadingCharging).ToArray();
+        var intervalMilliseconds = chargingReadings.Length == 0
+            ? Math.Max(1, _settings.PollingIntervalMinutes) * 60 * 1000
+            : chargingReadings.All(IsReadingFullyCharged)
+                ? FullChargePollingIntervalMilliseconds
+                : !_displayActive
+                    ? SteadyChargingPollingIntervalMilliseconds
+                    : DateTime.UtcNow < _chargingFastUntilUtc
+                        ? ChargingPollingIntervalMilliseconds
+                        : SteadyChargingPollingIntervalMilliseconds;
+        if (_pollTimer.Enabled && _activePollingIntervalMilliseconds == intervalMilliseconds)
+            return;
+
         _pollTimer.Stop();
-        _pollTimer.Interval = Math.Max(1, _settings.PollingIntervalMinutes) * 60 * 1000;
+        _activePollingIntervalMilliseconds = intervalMilliseconds;
+        _pollTimer.Interval = intervalMilliseconds;
         _pollTimer.Start();
+    }
+
+    private static string CreateReadingStateKey(IReadOnlyList<BatteryReading> readings, string source, string failureReason)
+    {
+        var devices = readings
+            .OrderBy(reading => reading.DeviceId, StringComparer.OrdinalIgnoreCase)
+            .Select(reading => $"{reading.DeviceId}:{reading.BatteryPercentage}:{reading.PowerState}:{reading.ExternalPowerConnected}:{reading.Freshness}:{reading.Source}");
+        return $"{source}|{failureReason}|{string.Join(";", devices)}";
+    }
+
+    private TimeSpan CurrentStaleThreshold()
+    {
+        var milliseconds = _activePollingIntervalMilliseconds > 0
+            ? _activePollingIntervalMilliseconds * 2L
+            : Math.Max(1, _settings.PollingIntervalMinutes) * 120_000L;
+        return TimeSpan.FromMilliseconds(Math.Clamp(milliseconds, 30_000L, 30 * 60_000L));
     }
 
     private void KeepSoundMenuOpenBriefly()
     {
         _keepSoundMenuOpen = true;
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(250);
-            try
-            {
-                if (!_ui.IsDisposed && _ui.IsHandleCreated)
-                    _ui.BeginInvoke((MethodInvoker)(() => _keepSoundMenuOpen = false));
-            }
-            catch { }
-        });
     }
 
     private void KeepSoundMenuOpenWhenPreviewing(object? sender, ToolStripDropDownClosingEventArgs e)
@@ -814,7 +1189,18 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private static bool IsReadingCharging(BatteryReading reading)
     {
-        return reading.IsCableConnected || reading.IsCharging || reading.IsFullyCharged;
+        return reading.PowerState is DevicePowerState.Charging or DevicePowerState.FullyCharged or DevicePowerState.PendingCharge
+            || reading.ExternalPowerConnected == true
+            || reading.IsCableConnected
+            || reading.IsCharging
+            || reading.IsFullyCharged;
+    }
+
+    private static bool IsReadingFullyCharged(BatteryReading reading)
+    {
+        return reading.PowerState == DevicePowerState.FullyCharged
+            || reading.IsFullyCharged
+            || (IsReadingCharging(reading) && reading.BatteryPercentage >= 100);
     }
 
     private string MouseCountLabel(int count)
@@ -826,9 +1212,12 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private string FormatCompactReading(BatteryReading reading)
     {
-        return IsReadingCharging(reading)
+        var value = IsReadingCharging(reading)
             ? $"{reading.BatteryPercentage}% {_text["Charging"]}"
             : $"{reading.BatteryPercentage}%";
+        return reading.Freshness == BatteryDataFreshness.Stale
+            ? $"{value} ({LocalizeFailure("read_failed")})"
+            : value;
     }
 
     private string FormatDeviceReading(BatteryReading reading)
@@ -848,16 +1237,25 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private void UpdateIcon(bool cableConnected, int batteryBucket)
     {
-        var key = cableConnected ? "plugged" : $"battery:{batteryBucket}";
+        var fullyCharged = cableConnected
+            && batteryBucket >= 100
+            && _lastReadings.Count > 0
+            && _lastReadings.All(IsReadingFullyCharged);
+        var key = fullyCharged
+            ? "full"
+            : cableConnected
+                ? $"charging:{batteryBucket}"
+                : $"battery:{batteryBucket}";
         if (string.Equals(_lastIconKey, key, StringComparison.Ordinal))
             return;
 
         _lastIconKey = key;
-        var icon = CreateBatteryIcon(cableConnected ? 100 : batteryBucket, cableConnected);
-        var previous = _dynamicIcon;
-        _dynamicIcon = icon;
+        if (!_iconCache.TryGetValue(key, out var icon))
+        {
+            icon = CreateBatteryIcon(batteryBucket, cableConnected, fullyCharged);
+            _iconCache[key] = icon;
+        }
         _notifyIcon.Icon = icon;
-        previous?.Dispose();
     }
 
     private void SetDefaultIcon()
@@ -866,20 +1264,57 @@ internal sealed class TrayAppContext : ApplicationContext
             return;
 
         _lastIconKey = "default";
-        var icon = LoadAppIcon();
-        var previous = _dynamicIcon;
-        _dynamicIcon = icon;
-        _notifyIcon.Icon = icon;
-        previous?.Dispose();
+        _notifyIcon.Icon = _appIcon;
     }
 
-    private static Icon CreateBatteryIcon(int batteryBucket, bool cableConnected)
+    private static Icon CreateBatteryIcon(int batteryBucket, bool cableConnected, bool fullyCharged)
     {
-        const int size = 64;
-        using var bitmap = new Bitmap(size, size);
+        var frames = new List<(int Size, byte[] Bytes)>();
+        foreach (var size in new[] { 16, 20, 24, 32, 48, 64 })
+        {
+            using var bitmap = RenderBatteryBitmap(size, batteryBucket, cableConnected, fullyCharged);
+            using var png = new MemoryStream();
+            bitmap.Save(png, ImageFormat.Png);
+            frames.Add((size, png.ToArray()));
+        }
+
+        using var ico = new MemoryStream();
+        using (var writer = new BinaryWriter(ico, System.Text.Encoding.UTF8, leaveOpen: true))
+        {
+            writer.Write((ushort)0);
+            writer.Write((ushort)1);
+            writer.Write((ushort)frames.Count);
+            var offset = 6 + frames.Count * 16;
+            foreach (var frame in frames)
+            {
+                writer.Write((byte)frame.Size);
+                writer.Write((byte)frame.Size);
+                writer.Write((byte)0);
+                writer.Write((byte)0);
+                writer.Write((ushort)1);
+                writer.Write((ushort)32);
+                writer.Write(frame.Bytes.Length);
+                writer.Write(offset);
+                offset += frame.Bytes.Length;
+            }
+            foreach (var frame in frames)
+                writer.Write(frame.Bytes);
+        }
+
+        ico.Position = 0;
+        using var icon = new Icon(ico);
+        return (Icon)icon.Clone();
+    }
+
+    private static Bitmap RenderBatteryBitmap(int size, int batteryBucket, bool cableConnected, bool fullyCharged)
+    {
+        var bitmap = new Bitmap(size, size);
         using var g = Graphics.FromImage(bitmap);
         g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        g.CompositingQuality = CompositingQuality.HighQuality;
         g.Clear(Color.Transparent);
+        g.ScaleTransform(size / 64f, size / 64f);
 
         var body = new Rectangle(8, 19, 43, 27);
         var tip = new Rectangle(51, 27, 5, 11);
@@ -890,7 +1325,7 @@ internal sealed class TrayAppContext : ApplicationContext
         g.DrawRoundedRectangle(outline, body, 6);
         g.DrawRectangle(outline, tip);
 
-        var fillColor = cableConnected
+        var fillColor = cableConnected || fullyCharged
             ? Color.FromArgb(34, 197, 94)
             : batteryBucket <= 10
                 ? Color.FromArgb(239, 68, 68)
@@ -901,10 +1336,9 @@ internal sealed class TrayAppContext : ApplicationContext
         using var fill = new SolidBrush(fillColor);
         g.FillRoundedRectangle(fill, new Rectangle(inner.X, inner.Y, fillWidth, inner.Height), 3);
 
-        if (cableConnected)
+        if (cableConnected || fullyCharged)
             DrawBolt(g, fillColor);
-        DrawBars(g, batteryBucket);
-        return ToIcon(bitmap);
+        return bitmap;
     }
 
     private static void DrawBolt(Graphics g, Color color)
@@ -916,25 +1350,10 @@ internal sealed class TrayAppContext : ApplicationContext
         g.DrawPolygon(pen, points);
     }
 
-    private static void DrawBars(Graphics g, int percentage)
-    {
-        var bars = Math.Clamp((int)Math.Ceiling(percentage / 25d), 1, 4);
-        using var brush = new SolidBrush(Color.FromArgb(230, 255, 255, 255));
-        for (var i = 0; i < bars; i++)
-            g.FillRectangle(brush, 15 + i * 7, 48, 4, 4);
-    }
-
-    private static Icon ToIcon(Bitmap bitmap)
-    {
-        var handle = bitmap.GetHicon();
-        try { return (Icon)Icon.FromHandle(handle).Clone(); }
-        finally { DestroyIcon(handle); }
-    }
-
     private static Icon LoadAppIcon()
     {
         var path = Path.Combine(AppContext.BaseDirectory, "Assets", "SoraV2BatteryTip.ico");
-        return File.Exists(path) ? new Icon(path) : SystemIcons.Application;
+        return File.Exists(path) ? new Icon(path) : (Icon)SystemIcons.Application.Clone();
     }
 
     protected override void Dispose(bool disposing)
@@ -948,32 +1367,55 @@ internal sealed class TrayAppContext : ApplicationContext
             _historyWindow?.Dispose();
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
-            _dynamicIcon?.Dispose();
+            foreach (var icon in _iconCache.Values)
+                icon.Dispose();
+            _iconCache.Clear();
+            _appIcon.Dispose();
+            lock (_deviceRefreshSync)
+            {
+                _deviceRefreshCts?.Cancel();
+                _deviceRefreshCts?.Dispose();
+                _deviceRefreshCts = null;
+            }
             _checkGate.Dispose();
         }
         base.Dispose(disposing);
     }
+}
 
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool DestroyIcon(IntPtr hIcon);
+internal enum PowerBroadcastEvent
+{
+    Suspend,
+    Resume,
+    DisplayOn,
+    DisplayOff
 }
 
 internal sealed class DeviceChangeWindow : NativeWindow, IDisposable
 {
+    private const int WM_POWERBROADCAST = 0x0218;
     private const int WM_DEVICECHANGE = 0x0219;
+    private const int PBT_APMSUSPEND = 0x0004;
+    private const int PBT_APMRESUMEAUTOMATIC = 0x0012;
+    private const int PBT_POWERSETTINGCHANGE = 0x8013;
     private const int DBT_DEVICEARRIVAL = 0x8000;
     private const int DBT_DEVICEREMOVECOMPLETE = 0x8004;
     private const int DBT_DEVTYP_DEVICEINTERFACE = 0x00000005;
     private const int DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000;
     private static readonly Guid HidInterfaceGuid = new("4D1E55B2-F16F-11CF-88CB-001111000030");
+    private static Guid SessionDisplayStatusGuid = new("2B84C20E-AD23-4DDF-93DB-05FFBD7EFCA5");
     private readonly Action<string, bool> _onChange;
+    private readonly Action<PowerBroadcastEvent> _onPowerEvent;
     private IntPtr _notificationHandle;
+    private IntPtr _powerNotificationHandle;
 
-    public DeviceChangeWindow(Action<string, bool> onChange)
+    public DeviceChangeWindow(Action<string, bool> onChange, Action<PowerBroadcastEvent> onPowerEvent)
     {
         _onChange = onChange;
+        _onPowerEvent = onPowerEvent;
         CreateHandle(new CreateParams());
         RegisterHidNotifications();
+        _powerNotificationHandle = RegisterPowerSettingNotification(Handle, ref SessionDisplayStatusGuid, DEVICE_NOTIFY_WINDOW_HANDLE);
     }
 
     protected override void WndProc(ref Message m)
@@ -992,6 +1434,23 @@ internal sealed class DeviceChangeWindow : NativeWindow, IDisposable
                 }
             }
         }
+        else if (m.Msg == WM_POWERBROADCAST)
+        {
+            var eventType = m.WParam.ToInt32();
+            if (eventType == PBT_APMSUSPEND)
+                _onPowerEvent(PowerBroadcastEvent.Suspend);
+            else if (eventType == PBT_APMRESUMEAUTOMATIC)
+                _onPowerEvent(PowerBroadcastEvent.Resume);
+            else if (eventType == PBT_POWERSETTINGCHANGE && m.LParam != IntPtr.Zero)
+            {
+                var setting = Marshal.PtrToStructure<PowerBroadcastSetting>(m.LParam);
+                if (setting.PowerSetting == SessionDisplayStatusGuid && setting.DataLength >= sizeof(int))
+                {
+                    var value = Marshal.ReadInt32(m.LParam, Marshal.SizeOf<PowerBroadcastSetting>());
+                    _onPowerEvent(value == 0 ? PowerBroadcastEvent.DisplayOff : PowerBroadcastEvent.DisplayOn);
+                }
+            }
+        }
         base.WndProc(ref m);
     }
 
@@ -1001,6 +1460,11 @@ internal sealed class DeviceChangeWindow : NativeWindow, IDisposable
         {
             UnregisterDeviceNotification(_notificationHandle);
             _notificationHandle = IntPtr.Zero;
+        }
+        if (_powerNotificationHandle != IntPtr.Zero)
+        {
+            UnregisterPowerSettingNotification(_powerNotificationHandle);
+            _powerNotificationHandle = IntPtr.Zero;
         }
         DestroyHandle();
     }
@@ -1034,11 +1498,24 @@ internal sealed class DeviceChangeWindow : NativeWindow, IDisposable
         public Guid ClassGuid;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PowerBroadcastSetting
+    {
+        public Guid PowerSetting;
+        public int DataLength;
+    }
+
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr RegisterDeviceNotification(IntPtr recipient, ref DevBroadcastDeviceInterface notificationFilter, int flags);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool UnregisterDeviceNotification(IntPtr handle);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr RegisterPowerSettingNotification(IntPtr recipient, ref Guid powerSettingGuid, int flags);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool UnregisterPowerSettingNotification(IntPtr handle);
 }
 
 internal static class GraphicsExtensions

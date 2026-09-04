@@ -1,5 +1,22 @@
 ﻿namespace SoraV2BatteryTip;
 
+internal enum DevicePowerState
+{
+    Unknown,
+    Discharging,
+    Charging,
+    FullyCharged,
+    PendingCharge,
+    PendingDischarge,
+    Offline
+}
+
+internal enum BatteryDataFreshness
+{
+    Fresh,
+    Stale
+}
+
 internal sealed class BatteryReading
 {
     public int BatteryPercentage { get; init; }
@@ -8,20 +25,19 @@ internal sealed class BatteryReading
     public bool IsFullyCharged { get; init; }
     public bool IsOnline { get; init; } = true;
     public bool IsCableConnected { get; init; }
+    public DevicePowerState PowerState { get; init; }
+    public bool? ExternalPowerConnected { get; init; }
+    public BatteryDataFreshness Freshness { get; init; } = BatteryDataFreshness.Fresh;
+    public DateTime LastSuccessfulReadUtc { get; init; } = DateTime.UtcNow;
+    public int ConsecutiveFailures { get; init; }
+    public string ProviderName { get; init; } = "";
     public string DeviceName { get; init; } = "";
     public string DeviceId { get; init; } = "";
+    public string DeviceSerial { get; init; } = "";
     public string VendorId { get; init; } = "";
     public string ProductId { get; init; } = "";
     public string Source { get; init; } = "unknown";
     public DateTime TimestampUtc { get; init; } = DateTime.UtcNow;
-}
-
-internal sealed class BatteryReadResult
-{
-    public BatteryReading? Reading { get; init; }
-    public string Source { get; init; } = "none";
-    public string FailureReason { get; init; } = "not_detected";
-    public bool Success => Reading != null;
 }
 
 internal sealed class BatteryReadAllResult
@@ -29,7 +45,28 @@ internal sealed class BatteryReadAllResult
     public IReadOnlyList<BatteryReading> Readings { get; init; } = Array.Empty<BatteryReading>();
     public string Source { get; init; } = "none";
     public string FailureReason { get; init; } = "not_detected";
+    public bool HasCandidate { get; init; }
+    public bool InventoryReliable { get; init; } = true;
+    public IReadOnlyList<ProviderBatchResult> ProviderResults { get; init; } = Array.Empty<ProviderBatchResult>();
     public bool Success => Readings.Count > 0;
+}
+
+internal sealed class ProviderReadResult
+{
+    public IReadOnlyList<BatteryReading> Readings { get; init; } = Array.Empty<BatteryReading>();
+    public bool CandidateFound { get; init; }
+    public IReadOnlyList<string> CandidateDeviceIds { get; init; } = Array.Empty<string>();
+    public string Error { get; init; } = "";
+}
+
+internal sealed class ProviderBatchResult
+{
+    public string ProviderName { get; init; } = "";
+    public int Priority { get; init; }
+    public IReadOnlyList<BatteryReading> Readings { get; init; } = Array.Empty<BatteryReading>();
+    public bool CandidateFound { get; init; }
+    public IReadOnlyList<string> CandidateDeviceIds { get; init; } = Array.Empty<string>();
+    public string Error { get; init; } = "";
 }
 
 internal sealed class ProviderStatus
@@ -71,10 +108,4 @@ internal sealed class AppSettings
     public string Language { get; set; } = "auto";
     public string AlertSoundFile { get; set; } = "default.wav";
     public int AlertVolume { get; set; } = 15;
-}
-
-internal readonly record struct DeviceConnection(bool WiredPresent, bool WirelessPresent)
-{
-    public bool IsDetected => WiredPresent || WirelessPresent;
-    public bool IsCableConnected => WiredPresent;
 }

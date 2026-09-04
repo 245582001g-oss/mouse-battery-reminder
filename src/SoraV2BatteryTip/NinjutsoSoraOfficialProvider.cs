@@ -2,7 +2,7 @@ using HidSharp;
 
 namespace SoraV2BatteryTip;
 
-internal sealed class NinjutsoSoraOfficialProvider : IBatteryProvider, IMultipleBatteryProvider
+internal sealed class NinjutsoSoraOfficialProvider : IBatteryProvider
 {
     private const int VendorId = 0x1915;
     private const byte FeatureReportId = 0x05;
@@ -19,22 +19,18 @@ internal sealed class NinjutsoSoraOfficialProvider : IBatteryProvider, IMultiple
     public string Name => "SORA V2 Official HID";
     public int Priority => 300;
 
-    public bool IsAvailable() => EnumerateCandidateDevices().Any();
+    public bool IsAvailable(HidInventorySnapshot inventory) => EnumerateCandidateDevices(inventory).Any();
 
-    public Task<BatteryReading?> ReadAsync(CancellationToken token)
+    public Task<ProviderReadResult> ReadAsync(HidInventorySnapshot inventory, CancellationToken token)
     {
-        return Task.Run(() => ReadAllOnce(token).FirstOrDefault(), token);
+        return Task.Run(() => ReadAllOnce(inventory, token), token);
     }
 
-    public Task<IReadOnlyList<BatteryReading>> ReadAllAsync(CancellationToken token)
+    private static ProviderReadResult ReadAllOnce(HidInventorySnapshot inventory, CancellationToken token)
     {
-        return Task.Run<IReadOnlyList<BatteryReading>>(() => ReadAllOnce(token), token);
-    }
-
-    private static IReadOnlyList<BatteryReading> ReadAllOnce(CancellationToken token)
-    {
+        var devices = EnumerateCandidateDevices(inventory).ToArray();
         var readings = new List<BatteryReading>();
-        foreach (var device in EnumerateCandidateDevices())
+        foreach (var device in devices)
         {
             token.ThrowIfCancellationRequested();
 
@@ -43,7 +39,12 @@ internal sealed class NinjutsoSoraOfficialProvider : IBatteryProvider, IMultiple
                 readings.Add(reading);
         }
 
-        return readings;
+        return new ProviderReadResult
+        {
+            Readings = readings,
+            CandidateFound = devices.Length > 0,
+            CandidateDeviceIds = devices.Select(device => Safe(() => device.DevicePath)).Where(path => !string.IsNullOrWhiteSpace(path)).ToArray()
+        };
     }
 
     private static BatteryReading? TryReadDevice(HidDevice device)
@@ -117,6 +118,10 @@ internal sealed class NinjutsoSoraOfficialProvider : IBatteryProvider, IMultiple
             IsFullyCharged = charging && battery >= 100,
             IsOnline = true,
             IsCableConnected = charging,
+            PowerState = charging
+                ? battery >= 100 ? DevicePowerState.FullyCharged : DevicePowerState.Charging
+                : DevicePowerState.Discharging,
+            ExternalPowerConnected = charging,
             Source = "SORA V2 Official HID"
         };
     }
@@ -131,17 +136,21 @@ internal sealed class NinjutsoSoraOfficialProvider : IBatteryProvider, IMultiple
             IsFullyCharged = reading.IsFullyCharged,
             IsOnline = reading.IsOnline,
             IsCableConnected = reading.IsCableConnected,
+            PowerState = reading.PowerState,
+            ExternalPowerConnected = reading.ExternalPowerConnected,
             DeviceName = Safe(() => device.GetProductName()),
             DeviceId = Safe(() => device.DevicePath),
+            DeviceSerial = Safe(() => device.GetSerialNumber()),
             VendorId = $"0x{device.VendorID:X4}",
             ProductId = $"0x{device.ProductID:X4}",
-            Source = reading.Source
+            Source = reading.Source,
+            TimestampUtc = reading.TimestampUtc
         };
     }
 
-    private static IEnumerable<HidDevice> EnumerateCandidateDevices()
+    private static IEnumerable<HidDevice> EnumerateCandidateDevices(HidInventorySnapshot inventory)
     {
-        return DeviceList.Local.GetHidDevices()
+        return inventory.Devices
             .Where(device => device.VendorID == VendorId)
             .Where(device => SupportedProductIds.Contains(device.ProductID))
             .Where(device => SafeInt(device.GetMaxFeatureReportLength) >= MinimumFeatureLength)

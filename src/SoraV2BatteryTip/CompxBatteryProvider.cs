@@ -1,41 +1,30 @@
 using HidSharp;
-using System.Text;
-
 namespace SoraV2BatteryTip;
 
-internal sealed class CompxBatteryProvider : IBatteryProvider, IMultipleBatteryProvider
+internal sealed class CompxBatteryProvider : IBatteryProvider
 {
     private const int VendorId = 0x373B;
     private const byte ReportId = 0x08;
     private const byte CommandGetBatteryLevel = 0x04;
     private const int PayloadLength = 16;
     private const int ReportLength = PayloadLength + 1;
-    private const int IoTimeoutMs = 700;
-    private static readonly bool DiagnosticLoggingEnabled = false;
-    private static readonly string LogPath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-        "SoraV2BatteryTip",
-        "compx-hid-last.log");
+    private const int IoTimeoutMs = 450;
 
     public string Name => "ATK/COMPX HID";
     public int Priority => 250;
 
-    public bool IsAvailable() => EnumerateCandidateDevices().Any();
+    public bool IsAvailable(HidInventorySnapshot inventory) => EnumerateCandidateDevices(inventory).Any();
 
-    public Task<BatteryReading?> ReadAsync(CancellationToken token)
+    public Task<ProviderReadResult> ReadAsync(HidInventorySnapshot inventory, CancellationToken token)
     {
-        return Task.Run(() => ReadAllOnce(token).FirstOrDefault(), token);
+        return Task.Run(() => ReadAllOnce(inventory, token), token);
     }
 
-    public Task<IReadOnlyList<BatteryReading>> ReadAllAsync(CancellationToken token)
+    private static ProviderReadResult ReadAllOnce(HidInventorySnapshot inventory, CancellationToken token)
     {
-        return Task.Run<IReadOnlyList<BatteryReading>>(() => ReadAllOnce(token), token);
-    }
-
-    private static IReadOnlyList<BatteryReading> ReadAllOnce(CancellationToken token)
-    {
+        var devices = EnumerateCandidateDevices(inventory).ToArray();
         var readings = new List<BatteryReading>();
-        foreach (var device in EnumerateCandidateDevices())
+        foreach (var device in devices)
         {
             token.ThrowIfCancellationRequested();
 
@@ -44,7 +33,12 @@ internal sealed class CompxBatteryProvider : IBatteryProvider, IMultipleBatteryP
                 readings.Add(reading);
         }
 
-        return readings;
+        return new ProviderReadResult
+        {
+            Readings = readings,
+            CandidateFound = devices.Length > 0,
+            CandidateDeviceIds = devices.Select(device => Safe(() => device.DevicePath)).Where(path => !string.IsNullOrWhiteSpace(path)).ToArray()
+        };
     }
 
     private static BatteryReading? TryReadDevice(HidDevice device)
@@ -64,7 +58,6 @@ internal sealed class CompxBatteryProvider : IBatteryProvider, IMultipleBatteryP
                 {
                     try
                     {
-                        WriteLog(device, $"write {request.Name} length={request.Bytes.Length} inputLength={inputLength} request={ToHex(request.Bytes, request.Bytes.Length)}");
                         stream.Write(request.Bytes, 0, request.Bytes.Length);
 
                         var deadline = DateTime.UtcNow.AddMilliseconds(IoTimeoutMs);
@@ -75,23 +68,18 @@ internal sealed class CompxBatteryProvider : IBatteryProvider, IMultipleBatteryP
                             if (read <= 0)
                                 continue;
 
-                            WriteLog(device, $"read bytes={read} response={ToHex(response, read)}");
                             var parsed = TryParseResponse(response, read);
-                        if (parsed != null)
-                            return EnrichReading(parsed, device);
+                            if (parsed != null)
+                                return EnrichReading(parsed, device);
                         }
-
-                        WriteLog(device, $"read timeout without parsable response after {request.Name}");
                     }
-                    catch (Exception ex)
+                    catch
                     {
-                        WriteLog(device, $"{request.Name} {ex.GetType().Name}: {ex.Message}");
                     }
                 }
             }
-            catch (Exception ex)
+            catch
             {
-                WriteLog(device, $"{ex.GetType().Name}: {ex.Message}");
                 return null;
             }
         }
@@ -123,6 +111,10 @@ internal sealed class CompxBatteryProvider : IBatteryProvider, IMultipleBatteryP
                 IsFullyCharged = charging && battery >= 100,
                 IsOnline = true,
                 IsCableConnected = charging,
+                PowerState = charging
+                    ? battery >= 100 ? DevicePowerState.FullyCharged : DevicePowerState.Charging
+                    : DevicePowerState.Discharging,
+                ExternalPowerConnected = charging,
                 Source = "ATK/COMPX HID"
             };
         }
@@ -140,11 +132,15 @@ internal sealed class CompxBatteryProvider : IBatteryProvider, IMultipleBatteryP
             IsFullyCharged = reading.IsFullyCharged,
             IsOnline = reading.IsOnline,
             IsCableConnected = reading.IsCableConnected,
+            PowerState = reading.PowerState,
+            ExternalPowerConnected = reading.ExternalPowerConnected,
             DeviceName = Safe(() => device.GetProductName()),
             DeviceId = Safe(() => device.DevicePath),
+            DeviceSerial = Safe(() => device.GetSerialNumber()),
             VendorId = $"0x{device.VendorID:X4}",
             ProductId = $"0x{device.ProductID:X4}",
-            Source = reading.Source
+            Source = reading.Source,
+            TimestampUtc = reading.TimestampUtc
         };
     }
 
@@ -185,9 +181,9 @@ internal sealed class CompxBatteryProvider : IBatteryProvider, IMultipleBatteryP
         return unchecked((byte)(85 - (sum & 0xFF)));
     }
 
-    private static IEnumerable<HidDevice> EnumerateCandidateDevices()
+    private static IEnumerable<HidDevice> EnumerateCandidateDevices(HidInventorySnapshot inventory)
     {
-        var devices = DeviceList.Local.GetHidDevices()
+        var devices = inventory.Devices
             .Where(device => device.VendorID == VendorId)
             .Where(HasCompxReportShape)
             .OrderByDescending(DeviceScore)
@@ -216,40 +212,6 @@ internal sealed class CompxBatteryProvider : IBatteryProvider, IMultipleBatteryP
             return false;
 
         return true;
-    }
-
-    private static void WriteLog(HidDevice device, string message)
-    {
-        if (!DiagnosticLoggingEnabled)
-            return;
-
-        try
-        {
-            var dir = Path.GetDirectoryName(LogPath);
-            if (!string.IsNullOrWhiteSpace(dir))
-                Directory.CreateDirectory(dir);
-
-            var line = new StringBuilder()
-                .Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"))
-                .Append(" | ")
-                .Append($"vid=0x{device.VendorID:X4} pid=0x{device.ProductID:X4}")
-                .Append(" | ")
-                .Append($"usagePage={GetIntProperty(device, "UsagePage")?.ToString("X") ?? "-"} usage={GetIntProperty(device, "Usage")?.ToString("X") ?? "-"}")
-                .Append(" | ")
-                .Append(Safe(() => device.GetProductName()))
-                .Append(" | ")
-                .Append(message)
-                .AppendLine()
-                .ToString();
-
-            File.AppendAllText(LogPath, line, Encoding.UTF8);
-        }
-        catch { }
-    }
-
-    private static string ToHex(byte[] bytes, int length)
-    {
-        return Convert.ToHexString(bytes.AsSpan(0, Math.Clamp(length, 0, bytes.Length)).ToArray());
     }
 
     private static bool IsOfficialCompxInterface(HidDevice device)

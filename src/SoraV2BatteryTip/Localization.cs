@@ -70,6 +70,15 @@ internal sealed class Localizer
         "HistoryConsumed" => "范围内消耗",
         "HistoryAverage" => "平均耗电",
         "HistoryLastFull" => "最近满电/充电",
+        "HistoryConfidence" => "可信度",
+        "HistoryBasis" => "预测依据",
+        "HistorySegments" => "个片段",
+        "ConfidenceNone" => "数据不足",
+        "ConfidenceLow" => "低",
+        "ConfidenceMedium" => "中",
+        "ConfidenceHigh" => "高",
+        "HistoryChartLegend" => "真实记录 · 绿色区段表示充电 · 虚线表示无记录",
+        "HistoryDailyLegend" => "每日实际耗电 · 预测始终使用最近30天有效记录",
         _ => key
     };
 
@@ -133,6 +142,15 @@ internal sealed class Localizer
         "HistoryConsumed" => "Used in range",
         "HistoryAverage" => "Average drain",
         "HistoryLastFull" => "Last full/charge",
+        "HistoryConfidence" => "Confidence",
+        "HistoryBasis" => "Basis",
+        "HistorySegments" => "segments",
+        "ConfidenceNone" => "insufficient data",
+        "ConfidenceLow" => "low",
+        "ConfidenceMedium" => "medium",
+        "ConfidenceHigh" => "high",
+        "HistoryChartLegend" => "Real records · green means charging · dashed means no record",
+        "HistoryDailyLegend" => "Daily battery used · forecast always uses valid records from the last 30 days",
         _ => key
     };
 }
