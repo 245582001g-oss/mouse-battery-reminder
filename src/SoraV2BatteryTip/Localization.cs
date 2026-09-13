@@ -13,6 +13,10 @@ internal sealed class Localizer
     private static string Zh(string key) => key switch
     {
         "AppName" => "鼠标电量提醒",
+        "Version" => "版本",
+        "VerifyingDisconnect" => "正在确认电源状态",
+        "LastKnownBattery" => "上次电量",
+        "Failure_verifying_disconnect" => "拔线后正在复核",
         "NotReady" => "鼠标电量提醒：未检测到",
         "Checking" => "鼠标电量提醒：正在检测...",
         "Charging" => "充电中",
@@ -86,6 +90,10 @@ internal sealed class Localizer
     private static string En(string key) => key switch
     {
         "AppName" => "Mouse Battery Reminder",
+        "Version" => "Version",
+        "VerifyingDisconnect" => "Verifying power state",
+        "LastKnownBattery" => "last battery",
+        "Failure_verifying_disconnect" => "verifying after unplug",
         "NotReady" => "Mouse Battery Reminder: not detected",
         "Checking" => "Mouse Battery Reminder: checking...",
         "Charging" => "charging",

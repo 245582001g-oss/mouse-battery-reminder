@@ -40,6 +40,7 @@ internal sealed class TrayAppContext : ApplicationContext
     private readonly CancellationTokenSource _shutdownCts = new();
     private readonly LowBatteryAlertTracker _alertTracker = new();
     private readonly ChargingPollingPolicy _chargingPollingPolicy = new();
+    private readonly SoraDisconnectRecovery _disconnectRecovery;
     private readonly Dictionary<string, DeviceRefreshEvent> _deviceRefreshEvents = new(StringComparer.OrdinalIgnoreCase);
     private HashSet<string> _deviceRefreshBaselinePaths = new(StringComparer.OrdinalIgnoreCase);
 
@@ -78,6 +79,7 @@ internal sealed class TrayAppContext : ApplicationContext
     {
         _paths = paths;
         _log = log;
+        _disconnectRecovery = new SoraDisconnectRecovery(log);
         _log.Write("info", "tray.init_started", nameof(TrayAppContext), "success");
         _paths.Ensure();
         _settingsStore = new SettingsStore(_paths, _log);
@@ -179,6 +181,7 @@ internal sealed class TrayAppContext : ApplicationContext
         _menu.Items.Add(new ToolStripSeparator());
         _lastCheckItem = new ToolStripMenuItem($"{_text["LastCheck"]}: {(_lastCheckLocal.HasValue ? _lastCheckLocal.Value.ToString("HH:mm:ss") : _text["Never"])}") { Enabled = false };
         _menu.Items.Add(_lastCheckItem);
+        _menu.Items.Add(new ToolStripMenuItem($"{_text["Version"]}: v{typeof(TrayAppContext).Assembly.GetName().Version?.ToString(3)}") { Enabled = false });
         _menu.Items.Add(new ToolStripMenuItem($"{_text["Source"]}: {_lastSource}") { Enabled = false });
         if (!string.IsNullOrWhiteSpace(_lastFailureReason))
             _menu.Items.Add(new ToolStripMenuItem($"{_text["FailureReason"]}: {LocalizeFailure(_lastFailureReason)}") { Enabled = false });
@@ -652,13 +655,11 @@ internal sealed class TrayAppContext : ApplicationContext
                 _lastCheckItem.Text = $"{_text["LastCheck"]}: {_lastCheckLocal.Value:HH:mm:ss}";
 
             var stateUpdate = _deviceStates.Apply(result, DateTime.UtcNow, CurrentStaleThreshold());
-            var usableFreshReadings = stateUpdate.FreshReadings
-                .Where(IsUsableFreshBatterySample)
-                .ToArray();
             foreach (var rekey in stateUpdate.Rekeys)
             {
                 var previousRuntimeKey = DeviceIdentity.CreateRuntimeKey(rekey.PreviousReading);
                 var currentRuntimeKey = DeviceIdentity.CreateRuntimeKey(rekey.CurrentReading);
+                _disconnectRecovery.MoveState(previousRuntimeKey, currentRuntimeKey, rekey.PreservePolicyState);
                 var alertStateMoved = false;
                 var pollingStateMoved = false;
                 var alertStateCleared = false;
@@ -689,6 +690,12 @@ internal sealed class TrayAppContext : ApplicationContext
                     }, reading: rekey.CurrentReading);
                 }
             }
+            var recoveryNowUtc = DateTime.UtcNow;
+            _disconnectRecovery.Observe(stateUpdate.FreshReadings, recoveryNowUtc);
+            var confirmedReadings = stateUpdate.FreshReadings
+                .Where(reading => !_disconnectRecovery.IsPending(reading, recoveryNowUtc))
+                .ToArray();
+            var usableFreshReadings = confirmedReadings.Where(IsUsableFreshBatterySample).ToArray();
             foreach (var reading in stateUpdate.OfflineReadings)
             {
                 _history.MarkOffline(reading);
@@ -703,14 +710,15 @@ internal sealed class TrayAppContext : ApplicationContext
             if (stateUpdate.CurrentReadings.Count > 0)
             {
                 _lastSource = string.Join(", ", stateUpdate.CurrentReadings.Select(reading => reading.Source).Distinct(StringComparer.OrdinalIgnoreCase));
-                _lastFailureReason = usableFreshReadings.Length > 0 ? "" : "read_failed";
-                ApplyReadings(stateUpdate.CurrentReadings);
+                _lastFailureReason = usableFreshReadings.Length > 0 ? ""
+                    : _disconnectRecovery.IsActive(recoveryNowUtc) ? "verifying_disconnect" : "read_failed";
+                ApplyReadings(stateUpdate.CurrentReadings.Select(reading => _disconnectRecovery.Project(reading, recoveryNowUtc)).ToArray());
                 ApplyTimerInterval();
-                foreach (var reading in stateUpdate.FreshReadings)
+                foreach (var reading in confirmedReadings)
                     _history.Append(reading);
                 if (updateUi)
                     RenderTrayState();
-                ProcessLowBatteryAlerts(stateUpdate.FreshReadings);
+                ProcessLowBatteryAlerts(confirmedReadings);
                 if (!string.Equals(previousStateKey, CreateReadingStateKey(_lastReadings, _lastSource, _lastFailureReason), StringComparison.Ordinal))
                     RequestMenuRebuild();
                 _log.Write("debug", "poll.completed", nameof(TrayAppContext), usableFreshReadings.Length > 0 ? "success" : "degraded", new
@@ -719,7 +727,7 @@ internal sealed class TrayAppContext : ApplicationContext
                     trigger,
                     duration_ms = started.ElapsedMilliseconds,
                     current_count = stateUpdate.CurrentReadings.Count,
-                    fresh_count = stateUpdate.FreshReadings.Count,
+                    fresh_count = usableFreshReadings.Length,
                     offline_count = stateUpdate.OfflineReadings.Count,
                     rekey_count = stateUpdate.Rekeys.Count,
                     candidate_coverage_complete = candidateCoverageComplete,
@@ -927,6 +935,15 @@ internal sealed class TrayAppContext : ApplicationContext
                 fact_basis = "windows_wm_devicechange"
             });
             _hidInventory.Invalidate(arrived ? "device_arrival" : "device_removal");
+            if (arrived)
+                _disconnectRecovery.ObserveArrival(devicePath);
+            else if (_disconnectRecovery.BeginRemoval(devicePath, _lastReadings, DateTime.UtcNow))
+            {
+                var nowUtc = DateTime.UtcNow;
+                ApplyReadings(_lastReadings.Select(reading => _disconnectRecovery.Project(reading, nowUtc)).ToArray());
+                ApplyTimerInterval();
+                RenderTrayState();
+            }
             ScheduleRefreshAfterChange(devicePath, deviceArrived: arrived);
         }
     }
@@ -1340,6 +1357,15 @@ internal sealed class TrayAppContext : ApplicationContext
             return;
         }
 
+        if (_lastReading?.PowerState == DevicePowerState.PendingDischarge)
+        {
+            var text = $"{_text["AppName"]}: {FormatCompactReading(_lastReading)}";
+            SetStatusText(text);
+            SetTrayText(TrimTrayText(text));
+            UpdateIcon(cableConnected: false, batteryBucket: _lastBatteryBucket ?? 100);
+            return;
+        }
+
         if (_lastFailureReason == "read_failed" && _lastBatteryPercentage.HasValue)
         {
             var text = $"{_text["AppName"]}: {_lastBatteryPercentage.Value}% ({LocalizeFailure(_lastFailureReason)})";
@@ -1463,7 +1489,9 @@ internal sealed class TrayAppContext : ApplicationContext
                 DevicePowerSemantics.IsExternallyPowered(reading),
                 DevicePowerSemantics.IsFullyCharged(reading)))
             .ToArray();
-        var decision = _chargingPollingPolicy.Evaluate(devices, _displayActive, DateTime.UtcNow, _settings);
+        var nowUtc = DateTime.UtcNow;
+        var decision = _chargingPollingPolicy.Evaluate(devices, _displayActive, nowUtc, _settings,
+            connectionRecoveryActive: _disconnectRecovery.IsActive(nowUtc));
         var intervalMilliseconds = (int)Math.Clamp(decision.Interval.TotalMilliseconds, 1, int.MaxValue);
         var intervalChanged = !_pollTimer.Enabled || _activePollingIntervalMilliseconds != intervalMilliseconds;
         var reasonChanged = _activePollingReason != decision.Reason;
@@ -1718,6 +1746,8 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private string FormatCompactReading(BatteryReading reading)
     {
+        if (reading.PowerState == DevicePowerState.PendingDischarge)
+            return $"{_text["VerifyingDisconnect"]} ({_text["LastKnownBattery"]} {reading.BatteryPercentage}%)";
         var value = DevicePowerSemantics.IsExternallyPowered(reading)
             ? $"{reading.BatteryPercentage}% {_text["Charging"]}"
             : $"{reading.BatteryPercentage}%";

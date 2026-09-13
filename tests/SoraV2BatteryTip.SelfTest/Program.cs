@@ -28,6 +28,13 @@ internal static class Program
             ("polling:new charging device extends fast window", PollingNewDeviceExtendsFastWindow),
             ("polling:display off and full rules win", PollingDisplayOffAndFullRulesWin),
             ("polling:stopping and re-entering charging restarts fast", PollingReentryRestartsFastWindow),
+            ("recovery:transient full report cannot postpone recheck", RecoveryTransientFullCannotPostponeRecheck),
+            ("recovery:unplug hides transient charging and confirms discharge", RecoveryUnplugConfirmsDischarge),
+            ("recovery:failed and charged samples break confirmation", RecoveryFailedSamplesBreakConfirmation),
+            ("recovery:unrelated removal does not affect another mouse", RecoveryUnrelatedRemovalIsIgnored),
+            ("recovery:rewiring cancels verification", RecoveryRewiringCancelsVerification),
+            ("recovery:verification is bounded with no samples", RecoveryVerificationIsBounded),
+            ("recovery:identity rekey preserves only matching epochs", RecoveryIdentityRekeyPreservesMatchingEpochs),
             ("sora:verified wired endpoint suppresses its receiver", SoraVerifiedWiredEndpointSuppressesReceiver),
             ("sora:receiver pairing response decodes AE12", SoraReceiverPairingResponseDecodesAe12),
             ("sora:pair cache rejects receiver serial epoch changes", SoraPairCacheRejectsReceiverSerialEpochChanges),
@@ -368,6 +375,122 @@ internal static class Program
             PollingSettings());
         Equal(ChargingPollingReason.FastCharging, reentered.Reason, "re-entry should restart fast polling");
         Equal(StartUtc.AddMinutes(6), reentered.FastUntilUtc, "re-entry deadline");
+    }
+
+    private static BatteryReading RecoveryReading(int battery, bool charging, bool wired = false, string logicalId = "ninjutso-sora-v2:receiver:unit-a") => new()
+    {
+        LogicalDeviceId = logicalId,
+        DeviceId = wired ? "wired-a" : "receiver-a",
+        ConnectionTransport = wired ? DeviceConnectionTransport.WiredUsb : DeviceConnectionTransport.Receiver,
+        BatteryPercentage = battery,
+        IsCharging = charging,
+        IsFullyCharged = charging && battery == 100,
+        IsCableConnected = wired || charging,
+        ExternalPowerConnected = wired || charging,
+        PowerState = charging ? DevicePowerState.Charging : DevicePowerState.Discharging,
+        LastSuccessfulReadUtc = StartUtc,
+        TimestampUtc = StartUtc
+    };
+
+    private static void RecoveryTransientFullCannotPostponeRecheck()
+    {
+        var policy = new ChargingPollingPolicy();
+        var full = new[] { ChargingDevice("mouse-a", isFullyCharged: true) };
+        var pending = policy.Evaluate(full, false, StartUtc, PollingSettings(), connectionRecoveryActive: true);
+        Equal(ChargingPollingReason.ConnectionRecovery, pending.Reason, "verification must override full and display off");
+        Equal(TimeSpan.FromSeconds(2), pending.Interval, "transient 100% must not schedule five minutes");
+        var noReading = policy.Evaluate(Array.Empty<ChargingPollingDevice>(), true, StartUtc.AddSeconds(2), PollingSettings(), true);
+        Equal(TimeSpan.FromSeconds(2), noReading.Interval, "unavailable receiver must still be rechecked");
+        var finished = policy.Evaluate(new[] { ChargingDevice("mouse-a", isCharging: false) }, true, StartUtc.AddSeconds(10), PollingSettings(10));
+        Equal(TimeSpan.FromMinutes(10), finished.Interval, "confirmed wireless state restores configured interval");
+    }
+
+    private static void RecoveryUnplugConfirmsDischarge()
+    {
+        var recovery = new SoraDisconnectRecovery();
+        var wired = RecoveryReading(53, true, wired: true);
+        True(recovery.BeginRemoval("WIRED-A", new[] { wired }, StartUtc), "known wired removal begins verification");
+        var pendingWired = recovery.Project(wired, StartUtc);
+        False(DevicePowerSemantics.IsExternallyPowered(pendingWired), "remove charging icon immediately");
+        var transient = RecoveryReading(100, true);
+        recovery.Observe(new[] { transient }, StartUtc.AddSeconds(2));
+        var pending = recovery.Project(transient, StartUtc.AddSeconds(2));
+        Equal(53, pending.BatteryPercentage, "do not publish transient full battery");
+        Equal(DevicePowerState.PendingDischarge, pending.PowerState, "pending state is explicit");
+        Equal(BatteryDataFreshness.Stale, pending.Freshness, "last battery must not be called fresh");
+        False(pending.IsCharging, "do not publish transient charging flag");
+        False(DevicePowerSemantics.IsFullyCharged(pending), "do not claim fully charged");
+        True(recovery.IsPending(transient, StartUtc.AddSeconds(2)), "exclude pending data from history and alerts");
+        var wireless = RecoveryReading(98, false);
+        recovery.Observe(new[] { wireless }, StartUtc.AddSeconds(4));
+        recovery.Observe(new[] { wireless }, StartUtc.AddSeconds(4));
+        True(recovery.IsActive(StartUtc.AddSeconds(4)), "same-time samples cannot confirm");
+        recovery.Observe(new[] { wireless }, StartUtc.AddSeconds(6));
+        False(recovery.IsActive(StartUtc.AddSeconds(6)), "spaced unpowered samples confirm discharge");
+        True(ReferenceEquals(wireless, recovery.Project(wireless, StartUtc.AddSeconds(6))), "publish actual 98% after confirmation");
+    }
+
+    private static void RecoveryFailedSamplesBreakConfirmation()
+    {
+        var recovery = new SoraDisconnectRecovery();
+        recovery.BeginRemoval("wired-a", new[] { RecoveryReading(53, true, true) }, StartUtc);
+        var wireless = RecoveryReading(98, false);
+        recovery.Observe(new[] { wireless }, StartUtc.AddSeconds(5));
+        recovery.Observe(Array.Empty<BatteryReading>(), StartUtc.AddSeconds(7));
+        recovery.Observe(new[] { wireless }, StartUtc.AddSeconds(9));
+        True(recovery.IsActive(StartUtc.AddSeconds(9)), "failure resets consecutive evidence");
+        recovery.Observe(new[] { RecoveryReading(100, true) }, StartUtc.AddSeconds(11));
+        recovery.Observe(new[] { wireless }, StartUtc.AddSeconds(13));
+        True(recovery.IsActive(StartUtc.AddSeconds(13)), "charging resets consecutive evidence");
+        recovery.Observe(new[] { wireless }, StartUtc.AddSeconds(15));
+        False(recovery.IsActive(StartUtc.AddSeconds(15)), "stable recovery eventually completes");
+    }
+
+    private static void RecoveryUnrelatedRemovalIsIgnored()
+    {
+        var recovery = new SoraDisconnectRecovery();
+        var wired = RecoveryReading(53, true, true);
+        False(recovery.BeginRemoval("keyboard", new[] { wired }, StartUtc), "unrelated HID must not trigger recovery");
+        False(recovery.BeginRemoval("receiver-a", new[] { RecoveryReading(70, false) }, StartUtc), "receiver removal is not unplugging a cable");
+        recovery.BeginRemoval("wired-a", new[] { wired }, StartUtc);
+        var other = RecoveryReading(75, true, logicalId: "ninjutso-sora-v2:receiver:unit-b");
+        True(ReferenceEquals(other, recovery.Project(other, StartUtc)), "another mouse can genuinely charge wirelessly");
+        False(recovery.BeginRemoval("wired-a", new[] { wired }, StartUtc.AddSeconds(50)), "duplicate event must not extend deadline");
+    }
+
+    private static void RecoveryRewiringCancelsVerification()
+    {
+        var recovery = new SoraDisconnectRecovery();
+        recovery.BeginRemoval("wired-a", new[] { RecoveryReading(53, true, true) }, StartUtc);
+        recovery.ObserveArrival("keyboard");
+        True(recovery.IsActive(StartUtc), "unrelated arrival must not cancel recovery");
+        recovery.ObserveArrival("WIRED-A");
+        False(recovery.IsActive(StartUtc), "rewiring restores normal charging handling");
+    }
+
+    private static void RecoveryVerificationIsBounded()
+    {
+        var recovery = new SoraDisconnectRecovery();
+        var wired = RecoveryReading(53, true, true);
+        recovery.BeginRemoval("wired-a", new[] { wired }, StartUtc);
+        recovery.Observe(Array.Empty<BatteryReading>(), StartUtc.AddSeconds(119));
+        True(recovery.IsActive(StartUtc.AddSeconds(119)), "failed reads keep verification active");
+        recovery.Observe(Array.Empty<BatteryReading>(), StartUtc.AddMinutes(2));
+        False(recovery.IsActive(StartUtc.AddMinutes(2)), "do not poll rapidly forever");
+        var externalCharger = RecoveryReading(80, true);
+        True(ReferenceEquals(externalCharger, recovery.Project(externalCharger, StartUtc.AddMinutes(2))), "bounded verification permits subsequent external charging");
+    }
+
+    private static void RecoveryIdentityRekeyPreservesMatchingEpochs()
+    {
+        var recovery = new SoraDisconnectRecovery();
+        var previous = RecoveryReading(53, true, true);
+        var current = RecoveryReading(100, true, logicalId: "ninjutso-sora-v2:receiver:canonical-a");
+        recovery.BeginRemoval("wired-a", new[] { previous }, StartUtc);
+        recovery.MoveState(DeviceIdentity.CreateRuntimeKey(previous), DeviceIdentity.CreateRuntimeKey(current), true);
+        True(recovery.IsPending(current, StartUtc), "identity canonicalization preserves verification");
+        recovery.MoveState(DeviceIdentity.CreateRuntimeKey(current), "replacement-epoch", false);
+        False(recovery.IsActive(StartUtc), "a replacement device must not inherit verification");
     }
 
     private static void SoraVerifiedWiredEndpointSuppressesReceiver()

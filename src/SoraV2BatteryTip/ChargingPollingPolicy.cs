@@ -6,7 +6,8 @@ internal enum ChargingPollingReason
     FastCharging,
     SteadyCharging,
     FullyCharged,
-    DisplayOff
+    DisplayOff,
+    ConnectionRecovery
 }
 
 internal sealed record ChargingPollingDevice(
@@ -26,6 +27,7 @@ internal sealed class ChargingPollingDecision
 internal sealed class ChargingPollingPolicy
 {
     internal static readonly TimeSpan FastChargingInterval = TimeSpan.FromSeconds(10);
+    internal static readonly TimeSpan ConnectionRecoveryInterval = TimeSpan.FromSeconds(2);
     internal static readonly TimeSpan SteadyChargingInterval = TimeSpan.FromMinutes(1);
     internal static readonly TimeSpan FullyChargedInterval = TimeSpan.FromMinutes(5);
     internal static readonly TimeSpan FastChargingWindow = TimeSpan.FromMinutes(1);
@@ -51,7 +53,8 @@ internal sealed class ChargingPollingPolicy
         IReadOnlyList<ChargingPollingDevice> devices,
         bool displayActive,
         DateTime nowUtc,
-        AppSettings settings)
+        AppSettings settings,
+        bool connectionRecoveryActive = false)
     {
         ArgumentNullException.ThrowIfNull(devices);
         ArgumentNullException.ThrowIfNull(settings);
@@ -112,6 +115,13 @@ internal sealed class ChargingPollingPolicy
                 reason = ChargingPollingReason.SteadyCharging;
                 interval = SteadyChargingInterval;
             }
+        }
+
+        // A transient full/charging report must never delay a post-unplug recheck.
+        if (connectionRecoveryActive)
+        {
+            reason = ChargingPollingReason.ConnectionRecovery;
+            interval = ConnectionRecoveryInterval;
         }
 
         return new ChargingPollingDecision
